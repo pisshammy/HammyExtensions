@@ -9,9 +9,6 @@ updates:
       day: monday
     commit-message:
       prefix: "chore"
-    labels:
-      - chore
-      - dependencies
     groups:
       security:
         applies-to: security-updates
