@@ -1,0 +1,59 @@
+{
+  "buildTime": "2026-10-19T04:13:08.309Z",
+  "builtWith": {
+    "toolchain": "1.0.0-alpha.91",
+    "types": "1.0.0-alpha.91"
+  },
+  "repository": {
+    "name": "hitomi-nhentai-extension",
+    "description": "Hitomi and NHentai extensions for Paperback"
+  },
+  "sources": [
+    {
+      "name": "Hitomi",
+      "description": "Extension that pulls content from hitomi.la",
+      "version": "1.6.9",
+      "icon": "icon.png",
+      "language": "multi",
+      "contentRating": "ADULT",
+      "capabilities": [
+        4,
+        64,
+        1,
+        32,
+        16
+      ],
+      "badges": [],
+      "developers": [
+        {
+          "name": "pisshammy",
+          "website": "cashapp: $0hammy0"
+        }
+      ],
+      "id": "Hitomi"
+    },
+    {
+      "name": "NHentai",
+      "description": "Extension that pulls content from nhentai.net",
+      "version": "2.9.9",
+      "icon": "icon.png",
+      "language": "multi",
+      "contentRating": "ADULT",
+      "capabilities": [
+        4,
+        64,
+        1,
+        32,
+        16
+      ],
+      "badges": [],
+      "developers": [
+        {
+          "name": "pisshammy",
+          "website": "cashapp: $0hammy0"
+        }
+      ],
+      "id": "NHentai"
+    }
+  ]
+}
