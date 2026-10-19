@@ -1,0 +1,34 @@
+{
+  "name": "hitomi-nhentai-extension",
+  "description": "Hitomi and NHentai extensions for Paperback",
+  "author": "pisshammy",
+  "keywords": [
+    "Paperback",
+    "extensions"
+  ],
+  "version": "0.9.0",
+  "license": "MIT",
+  "repositoryDescription": "Hitomi and NHentai extensions for Paperback",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint --type-aware --fix",
+    "lint:check": "oxlint --type-aware --deny-warnings",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "tsc": "tsc",
+    "bundle": "paperback-cli bundle",
+    "test": "npx paperback-cli test --noConsole",
+    "serve": "paperback-cli serve",
+    "logcat": "paperback-cli logcat --ip 192.168.1.65",
+    "dev": "paperback-cli serve --watch --port 3000",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@paperback/toolchain": "1.0.0-alpha.91",
+    "@paperback/types": "1.0.0-alpha.91",
+    "cheerio": "^1.2.0",
+    "husky": "^9.1.7",
+    "typescript": "^6.0.3"
+  }
+}
