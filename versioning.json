@@ -1,11 +1,11 @@
 {
-  "buildTime": "2026-10-19T04:13:08.309Z",
+  "buildTime": "2026-10-19T04:26:09.062Z",
   "builtWith": {
     "toolchain": "1.0.0-alpha.91",
     "types": "1.0.0-alpha.91"
   },
   "repository": {
-    "name": "hitomi-nhentai-extension",
+    "name": "HammyExtensions",
     "description": "Hitomi and NHentai extensions for Paperback"
   },
   "sources": [
