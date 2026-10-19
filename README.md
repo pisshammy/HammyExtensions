@@ -7,23 +7,21 @@ Paperback 0.9 extensions for:
 
 ## Install in Paperback
 
-Add this repository's GitHub Pages URL in Paperback under **Settings → Extensions → Add Repository**:
+Open the [Paperback installation page](https://pisshammy.github.io/HammyExtensions)
+
+Then tap **Add Repository to Paperback**.
+
+Otherwise, add this repository's GitHub Pages URL in Paperback under **Settings → Extensions → Add Repository**:
 
 ```text
-https://pisshammy.github.io/hammyExtensions
-```
-
-You can also use the one-tap link:
-
-```text
-paperback://addRepo?url=https%3A%2F%2Fpisshammy.github.io%2FhammyExtensions%2F
+https://pisshammy.github.io/HammyExtensions
 ```
 
 The repository is published automatically by GitHub Actions whenever `main` is updated.
 
 ## Support
 
-Source problems are handled in the [**OTHER-REPOS**](https://discord.com/invite/inkdex) channel of the [**Inkdex Discord**](https://discord.com/invite/inkdex) server, where the hammyExtension support chat lives.
+Source problems are handled in the [**OTHER-REPOS**](https://discord.com/invite/inkdex) channel of the [**Inkdex Discord**](https://discord.com/invite/inkdex) server, where the HammyExtension support chat lives. (TBD)
 
 Include the affected source, the page or title that failed, and screenshots or request details when possible, it makes fixes much faster.
 

@@ -482,7 +482,7 @@ export class StatisticsForm extends Form {
         {
           id: "details",
           footer:
-            "Bugs and suggestions can be reported through to the Inkdex Discord -> #other-repos -> hammyExtension Support Thread.",
+            "Bugs and suggestions can be reported through to the Inkdex Discord -> #other-repos -> HammyExtension Support Thread.",
         },
         [
           NavigationRow("contentStats", {
