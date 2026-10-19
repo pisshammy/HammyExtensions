@@ -29,6 +29,6 @@
     "@paperback/types": "1.0.0-alpha.91",
     "cheerio": "^1.2.0",
     "husky": "^9.1.7",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }
