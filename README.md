@@ -21,7 +21,7 @@ The repository is published automatically by GitHub Actions whenever `main` is u
 
 ## Support
 
-Source problems are handled in the [**OTHER-REPOS**](https://discord.com/invite/inkdex) channel of the [**Inkdex Discord**](https://discord.com/invite/inkdex) server, where the HammyExtension support chat lives. (TBD)
+Source problems are handled in the [**OTHER-REPOS**](https://discord.com/channels/965890377896845352/1561600901804851201) channel of the [**Inkdex Discord**](https://discord.com/invite/inkdex) server, where the HammyExtension support thread lives. 
 
 Include the affected source, the page or title that failed, and screenshots or request details when possible, it makes fixes much faster.
 
