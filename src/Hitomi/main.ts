@@ -80,6 +80,7 @@ import {
   getThumbnailQualitySetting,
   HitomiSearchSortId,
   incrementDisplayedManga,
+  incrementDisplayedMangaBatch,
   incrementMarkReadOnDescCount,
   parsePagesExpression,
   recordMangaReadCount,
@@ -93,6 +94,11 @@ import {
 } from "./settings";
 import { getGallery, getGalleryIds } from "./utils/gallery";
 import { ImageUriResolver } from "./utils/uri";
+import {
+  MAX_APPLICATION_STATE_BYTES,
+  serializedStateBytes,
+  takeEntriesWithinStateLimit,
+} from "../shared/state";
 
 class ReadHistory {
   private _ordered: string[];
@@ -212,7 +218,6 @@ type HitomiGalleryCacheItem = {
 
 const READ_STATE_KEY = "hitomi.readHistory";
 const COOKIE_JAR_STATE_KEY = "hitomi.cookieJar";
-const LAST_SEARCH_FILTERS_KEY = "hitomi.lastSearchFilters";
 const IDSET_CACHE_STATE_KEY = "hitomi.idSetCache.v1";
 const RELATED_VIEW_COUNTS_KEY = "hitomi.relatedViewCounts";
 const TAG_CACHE_STATE_KEY = "hitomi.tagCache";
@@ -223,6 +228,7 @@ const TAG_CACHE_LAST_FETCH_KEY = "hitomi.tagCacheLastFetch";
 const GALLERY_CACHE_STATE_KEY = "hitomi.galleryCache";
 const GALLERY_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const GALLERY_CACHE_MAX_SIZE = 300;
+const GALLERY_CACHE_SAVE_DEBOUNCE_MS = 250;
 
 class InlineSearchFilterForm extends SearchFilterForm {
   override getSections() {
@@ -1259,6 +1265,7 @@ function persistReadCache() {
 }
 
 function recordDisplayedTiles(items: readonly any[]): void {
+  const ids: string[] = [];
   for (const item of items) {
     try {
       const candidate =
@@ -1270,11 +1277,16 @@ function recordDisplayedTiles(items: readonly any[]): void {
           })
           : undefined;
       const id = candidate?.mangaId ?? candidate?.id ?? candidate?.galleryId;
-      if (typeof id === "string") incrementDisplayedManga(id);
-      else if (typeof id === "number") incrementDisplayedManga(String(id));
+      if (typeof id === "string") ids.push(id);
+      else if (typeof id === "number") ids.push(String(id));
     } catch {
       /* non-critical stats */
     }
+  }
+  try {
+    incrementDisplayedMangaBatch(ids);
+  } catch {
+    /* non-critical stats */
   }
 }
 
@@ -1509,6 +1521,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     return cache;
   })();
   private galleryCacheDirty = false;
+  private galleryCacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
   coverCache = new Map<string, string>();
 
   galleryPending = new Map<string, Promise<HitomiGallery>>();
@@ -1726,6 +1739,10 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
       if (restored > 0) {
         console.log(`[Hitomi] Restored ${restored} cached galleries`);
+        if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
+          this.galleryCacheDirty = true;
+          this.scheduleGalleryCacheSave();
+        }
       }
     } catch {
       // Ignore restore failures
@@ -1734,13 +1751,21 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
   private scheduleGalleryCacheSave(): void {
     this.galleryCacheDirty = true;
-    this.saveGalleryCache();
+    if (this.galleryCacheSaveTimer !== undefined) return;
+    this.galleryCacheSaveTimer = setTimeout(() => {
+      this.galleryCacheSaveTimer = undefined;
+      this.saveGalleryCache();
+    }, GALLERY_CACHE_SAVE_DEBOUNCE_MS);
   }
 
   private saveGalleryCache(): void {
     if (!this.galleryCacheDirty) return;
+    if (this.galleryCacheSaveTimer !== undefined) {
+      clearTimeout(this.galleryCacheSaveTimer);
+      this.galleryCacheSaveTimer = undefined;
+    }
     try {
-      const entries = this.galleryCache
+      const allEntries = this.galleryCache
         .entries()
         .map(([id, entry]) => {
           const gallery = entry.item.gallery;
@@ -1765,6 +1790,10 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
           (entry) =>
             [entry.id, { gallery: entry.gallery, ts: entry.ts }] as const,
         );
+      const entries = takeEntriesWithinStateLimit(
+        allEntries,
+        (candidate) => ({ entries: candidate }),
+      );
 
       Application.setState({ entries }, GALLERY_CACHE_STATE_KEY);
       this.galleryCacheDirty = false;
@@ -1975,7 +2004,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
   private saveIdSetCache(): void {
     try {
       const now = Date.now();
-      const entries = [...this.idSetCache.entries()]
+      const allEntries = [...this.idSetCache.entries()]
         .filter(([, entry]) => now - entry.ts < this.IDSET_TTL)
         .sort((a, b) => b[1].ts - a[1].ts)
         .slice(0, 120)
@@ -1986,6 +2015,10 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
               { ids: number[]; ts: number },
             ],
         );
+      const entries = takeEntriesWithinStateLimit(
+        allEntries,
+        (candidate) => ({ entries: candidate }),
+      );
       Application.setState({ entries }, IDSET_CACHE_STATE_KEY);
     } catch {
       // Ignore save failures
@@ -2636,8 +2669,15 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
   async getSearchFilters(): Promise<SearchFilter[]> {
     this.searchFiltersDirty = false;
 
-    const showTagCounts =
-      getDisplayOptionsSetting().includes("show_tag_counts");
+    // Read display options once for this build. The app can call this method
+    // repeatedly while rendering the search form, and reading state for every
+    // tag option makes that render look like a state-access loop.
+    const displayOptions = getDisplayOptionsSetting();
+    const showTagCounts = displayOptions.includes("show_tag_counts");
+    const sortTagsAlpha = displayOptions.includes("show_tags_alpha");
+    const abbreviateTagCounts = displayOptions.includes(
+      "abbreviate_tag_counts",
+    );
     await this.getTags({ allowPartial: !showTagCounts });
     const allDisplayableTags = this.getSearchFilterTagGroups().filter(
       (t) => !t.slugs.some((slug) => isUglyConventionTag(slug)),
@@ -2682,8 +2722,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
     // Sort selected/excluded tags to the top of the tag list
     const selectedIds = new Set(Object.keys(cleanedTags));
-    const sortTagsAlpha =
-      getDisplayOptionsSetting().includes("show_tags_alpha");
     const unselectedTags = displayTags.filter((t) => !selectedIds.has(t.id));
     if (sortTagsAlpha) {
       unselectedTags.sort((a, b) => a.display.localeCompare(b.display));
@@ -2716,10 +2754,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         type: "multiselect",
         title: "Tags",
         options: sortedTags.map((t) => {
-          const abbreviate = getDisplayOptionsSetting().includes(
-            "abbreviate_tag_counts",
-          );
-          const countStr = abbreviate
+          const countStr = abbreviateTagCounts
             ? _abbreviateCount(t.count)
             : t.count.toString();
           const cleanedLabel = t.display.replace(/\s*-\s*\([^)]*\)\s*$/, "");
@@ -3021,18 +3056,13 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       }
 
       try {
-        if (originalTitle || queryFilters.length > 0) {
-          Application.setState(
-            { title: originalTitle, filters: queryFilters },
-            LAST_SEARCH_FILTERS_KEY,
-          );
-        }
-
         // Always persist search filter values to state (even on first search)
+        let filtersChanged = false;
         if (filtersToPersist.length > 0) {
           for (const filter of filtersToPersist) {
             if (filter.id === "length" && typeof filter.value === "string") {
-              setSearchFilterLength(filter.value);
+              filtersChanged =
+                setSearchFilterLength(filter.value) || filtersChanged;
             } else if (filter.id === "tags") {
               const tagsValue = filter.value as
                 | Record<string, "included" | "excluded">
@@ -3041,17 +3071,22 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
                 const nextTags = { ...tagsValue };
                 // Strip leftover apply-manga-filter key from old state
                 delete nextTags["__apply_manga_filter_tags__"];
-                setSearchFilterTags(nextTags);
+                filtersChanged = setSearchFilterTags(nextTags) || filtersChanged;
               }
             }
           }
-          // Force the app to re-read filter defaults on next getSearchFilters call
-          this.searchFiltersDirty = true;
-          this.debouncedInvalidateSearchFilters();
+          if (filtersChanged) {
+            // Force the app to re-read filter defaults only when persistence
+            // actually changed a value. Re-invalidating on every search causes
+            // a search/filter feedback loop in the host framework.
+            this.searchFiltersDirty = true;
+            this.debouncedInvalidateSearchFilters();
+          }
         } else if (submittedFilters) {
-          setSearchFilterTags({});
-          this.searchFiltersDirty = true;
-          this.debouncedInvalidateSearchFilters();
+          if (setSearchFilterTags({})) {
+            this.searchFiltersDirty = true;
+            this.debouncedInvalidateSearchFilters();
+          }
         }
       } catch {
         /* ignore */
@@ -3479,7 +3514,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     } catch {
       /* stats tracking should never break main flow */
     }
-    this.debouncedInvalidateSearchFilters();
 
     const synopsis = this.buildSynopsis(gallery, isRead);
     const primaryTitle = normalizeBridgeString(
@@ -3575,7 +3609,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     } catch {
       /* stats tracking should never break chapter loading */
     }
-    this.debouncedInvalidateSearchFilters();
     const pages: string[] = [];
     const preferredImageFormat = getPreferredImageFormatSetting();
 
@@ -4747,14 +4780,21 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
   private persistRelatedPool(): void {
     try {
       const sanitizedPool = this.sanitizeRelatedPool(this.relatedPoolCache);
-      this.relatedPoolCache = sanitizedPool;
-      Application.setState(sanitizedPool, this.RELATED_POOL_STATE_KEY);
+      const persistedPool = takeEntriesWithinStateLimit(
+        sanitizedPool,
+        (candidate) => candidate,
+      );
+      this.relatedPoolCache = persistedPool;
+      Application.setState(persistedPool, this.RELATED_POOL_STATE_KEY);
       Application.setState(
         this.relatedPoolLastHistoryIndex,
         this.RELATED_POOL_HISTORY_INDEX_KEY,
       );
       Application.setState(
-        Array.from(this.relatedPoolSeenIds),
+        takeEntriesWithinStateLimit(
+          Array.from(this.relatedPoolSeenIds),
+          (candidate) => candidate,
+        ),
         this.RELATED_POOL_SEEN_IDS_KEY,
       );
     } catch {

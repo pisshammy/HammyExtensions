@@ -38,6 +38,11 @@ import NHentaiConfig from "./pbconfig";
 import { NHentaiInterceptor } from "./interceptors";
 import { parseRetryAfterMs } from "./utils/http";
 import {
+  MAX_APPLICATION_STATE_BYTES,
+  serializedStateBytes,
+  takeEntriesWithinStateLimit,
+} from "../shared/state";
+import {
   addDescMarkedReadId,
   ALL_DISCOVER_SECTIONS,
   DATE_FILTER_PRESETS,
@@ -83,6 +88,7 @@ import {
   getStatsTrackingEnabledSetting,
   getThumbnailQualitySetting,
   incrementDisplayedManga,
+  incrementDisplayedMangaBatch,
   incrementMarkReadOnDescCount,
   parsePagesExpression,
   recordMangaReadCount,
@@ -204,6 +210,7 @@ const GALLERY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const GALLERY_CACHE_MAX_SIZE = 250;
 const GALLERY_CACHE_STATE_KEY = "nhentai.galleryCache.v1";
 const TILE_STORE_STATE_KEY = "nhentai.tileStore.v1";
+const CACHE_SAVE_DEBOUNCE_MS = 250;
 // Keep initial discover burst to one request per section to manage rate limits.
 // With 6 discover sections (Popular, Recent, Random, etc.), this prevents burst 429s.
 const DISCOVER_FETCH_INITIAL_BATCH_SIZE = 1;
@@ -2208,6 +2215,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
   async getSearchFilters(): Promise<SearchFilter[]> {
     const filters: SearchFilter[] = [];
+    // Snapshot display options once. This method can be called repeatedly by
+    // the search-form renderer, and reading state inside the tag map causes
+    // one state access per popular tag.
+    const displayOptions = getDisplayOptionsSetting();
+    const sortTagsAlpha = displayOptions.includes("show_tags_alpha");
+    const showTagCounts = displayOptions.includes("show_tag_counts");
 
     // Length
     filters.push({
@@ -2280,8 +2293,6 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
     // Sort selected/excluded tags to the top of the tag list
     const selectedTagIds = new Set(Object.keys(cleanedTags));
-    const sortTagsAlpha =
-      getDisplayOptionsSetting().includes("show_tags_alpha");
     const unselectedPopularTags = popularTags.filter(
       (tag) => !selectedTagIds.has(tag.id),
     );
@@ -2299,8 +2310,6 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       title: "Tags",
       value: cleanedTags,
       options: sortedPopularTags.map((tag) => {
-        const showTagCounts =
-          getDisplayOptionsSetting().includes("show_tag_counts");
         const cleanedLabel = tag.label.replace(/\s*-\s*\([^)]*\)\s*$/, "");
         const countLabel = this.formatTagCount(
           this.parseTagCountValue(tag.count),
@@ -2425,14 +2434,6 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         effectiveSort = "date";
       if (effectiveSort === "top_reread" && !getEnableRereadSectionSetting())
         effectiveSort = "date";
-      // Increment non-carousel counter when user requests non-related search pages.
-      if (effectiveSort !== "related") {
-        try {
-          this.incrementNonCarouselCounter();
-        } catch {
-          /* ignore */
-        }
-      }
       let trimmedTitle = query.title?.trim() ?? "";
 
       // Detect OR groups typed in the search bar (e.g. "yuri OR maid" or "yuri || maid")
@@ -3027,8 +3028,6 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     "nhentai.relatedPoolHistoryIndex";
   private readonly RELATED_POOL_SEEN_IDS_KEY = "nhentai.relatedPoolSeenIds";
   private readonly RELATED_POOL_MAX_CURSOR_KEY = "nhentai.relatedPoolMaxCursor";
-  private readonly NONCAROUSEL_PAGE_COUNT_KEY = "nhentai.nonCarouselPageCount";
-
   // Lazy loading configuration
   private readonly LAZY_BATCH_SIZE = 4; // Load 4 history items at a time (reduced from 8 to avoid 429s)
   private readonly RELATED_PER_HISTORY = 5; // Max related per history item
@@ -3038,8 +3037,11 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   // gallery detail requests in lite mode (no date subtitles).
   private tileStore = new Map<string, LiteGalleryTile>();
   private tileStoreDirty = false;
+  private tileStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private galleryPending = new Map<string, Promise<Gallery>>();
   private galleryCache = new Map<string, GalleryCacheEntry>();
+  private galleryCacheDirty = false;
+  private galleryCacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
   private relatedPoolCache:
     | { id: number; tag: string; cycleIndex: number }[]
     | undefined;
@@ -3077,7 +3079,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       const now = Date.now();
       let restoredCount = 0;
       for (const [key, entry] of saved.entries) {
-        if (!entry?.response || now - entry.ts > this.getSearchCacheTtl(key)) {
+        if (
+          !entry?.response ||
+          !Array.isArray(entry.response.result) ||
+          entry.response.result.length === 0 ||
+          now - entry.ts > this.getSearchCacheTtl(key)
+        ) {
           continue;
         }
         this.searchCache.set(key, {
@@ -3093,6 +3100,9 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       }
       if (restoredCount > 0) {
         console.log(`[NHentai] Restored ${restoredCount} cached search pages`);
+        if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
+          this.saveSearchCache();
+        }
       }
     } catch {
       // Ignore restore failures
@@ -3151,6 +3161,9 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       this.pruneGalleryCache(now);
       if (restored > 0) {
         console.log(`[NHentai] Restored ${restored} cached galleries`);
+        if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
+          this.scheduleGalleryCacheSave();
+        }
       }
     } catch {
       // Ignore restore failures and continue with an empty in-memory cache.
@@ -3175,10 +3188,15 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   }
 
   private saveGalleryCache(): void {
+    if (!this.galleryCacheDirty) return;
+    if (this.galleryCacheSaveTimer !== undefined) {
+      clearTimeout(this.galleryCacheSaveTimer);
+      this.galleryCacheSaveTimer = undefined;
+    }
     try {
       const now = Date.now();
       this.pruneGalleryCache(now);
-      const entries = [...this.galleryCache.entries()]
+      const allEntries = [...this.galleryCache.entries()]
         .sort((a, b) => b[1].lastAccessAt - a[1].lastAccessAt)
         .slice(0, GALLERY_CACHE_MAX_SIZE)
         .map(
@@ -3195,7 +3213,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
               { gallery: Gallery; ts: number; lastAccessAt: number },
             ],
         );
+      const entries = takeEntriesWithinStateLimit(
+        allEntries,
+        (candidate) => ({ entries: candidate }),
+      );
       Application.setState({ entries }, GALLERY_CACHE_STATE_KEY);
+      this.galleryCacheDirty = false;
     } catch {
       // A cache write must never prevent gallery details from loading.
     }
@@ -3209,7 +3232,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     const now = Date.now();
     if (entry.expiresAt <= now) {
       this.galleryCache.delete(key);
-      this.saveGalleryCache();
+      this.scheduleGalleryCacheSave();
       return undefined;
     }
 
@@ -3233,13 +3256,22 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       lastAccessAt: now,
     });
     this.pruneGalleryCache(now);
-    this.saveGalleryCache();
+    this.scheduleGalleryCacheSave();
+  }
+
+  private scheduleGalleryCacheSave(): void {
+    this.galleryCacheDirty = true;
+    if (this.galleryCacheSaveTimer !== undefined) return;
+    this.galleryCacheSaveTimer = setTimeout(() => {
+      this.galleryCacheSaveTimer = undefined;
+      this.saveGalleryCache();
+    }, CACHE_SAVE_DEBOUNCE_MS);
   }
 
   private saveSearchCache(): void {
     try {
       const now = Date.now();
-      const entries = [...this.searchCache.entries()]
+      const allEntries = [...this.searchCache.entries()]
         .filter(([key, entry]) => now - entry.ts < this.getSearchCacheTtl(key))
         .sort((a, b) => b[1].ts - a[1].ts)
         .slice(0, 120)
@@ -3253,6 +3285,10 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
               },
             ] as [string, { response: QueryResponse; ts: number }],
         );
+      const entries = takeEntriesWithinStateLimit(
+        allEntries,
+        (candidate) => ({ entries: candidate }),
+      );
       Application.setState({ entries }, SEARCH_CACHE_STATE_KEY);
     } catch {
       // Ignore save failures
@@ -3270,6 +3306,10 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           this.tileStore.set(key, tile);
         }
       }
+      if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
+        this.tileStoreDirty = true;
+        this.saveTileStore();
+      }
     } catch {
       // Ignore restore failures
     }
@@ -3277,9 +3317,22 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
   private saveTileStore(): void {
     if (!this.tileStoreDirty) return;
+    if (this.tileStoreSaveTimer !== undefined) return;
+    this.tileStoreSaveTimer = setTimeout(() => {
+      this.tileStoreSaveTimer = undefined;
+      this.flushTileStore();
+    }, CACHE_SAVE_DEBOUNCE_MS);
+  }
+
+  private flushTileStore(): void {
+    if (!this.tileStoreDirty) return;
     this.tileStoreDirty = false;
     try {
-      const entries = [...this.tileStore.entries()];
+      const allEntries = [...this.tileStore.entries()];
+      const entries = takeEntriesWithinStateLimit(
+        allEntries,
+        (candidate) => candidate,
+      );
       Application.setState(entries, TILE_STORE_STATE_KEY);
     } catch {
       // Ignore save failures
@@ -3408,18 +3461,6 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     this.galleryDetailProbeAfter = 0;
   }
 
-
-  private incrementNonCarouselCounter(): void {
-    try {
-      const current =
-        (Application.getState(this.NONCAROUSEL_PAGE_COUNT_KEY) as
-          | number
-          | undefined) ?? 0;
-      Application.setState(current + 1, this.NONCAROUSEL_PAGE_COUNT_KEY);
-    } catch {
-      /* ignore */
-    }
-  }
 
   private async fetchRelatedPool(
     neededCount = 20,
@@ -3695,13 +3736,21 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   /** Persist related pool state once (called after the expansion while-loop). */
   private persistRelatedPool(): void {
     try {
-      Application.setState(this.relatedPoolCache, this.RELATED_POOL_STATE_KEY);
+      const persistedPool = takeEntriesWithinStateLimit(
+        this.relatedPoolCache ?? [],
+        (candidate) => candidate,
+      );
+      this.relatedPoolCache = persistedPool;
+      Application.setState(persistedPool, this.RELATED_POOL_STATE_KEY);
       Application.setState(
         this.relatedPoolLastHistoryIndex,
         this.RELATED_POOL_HISTORY_INDEX_KEY,
       );
       Application.setState(
-        Array.from(this.relatedPoolSeenIds),
+        takeEntriesWithinStateLimit(
+          Array.from(this.relatedPoolSeenIds),
+          (candidate) => candidate,
+        ),
         this.RELATED_POOL_SEEN_IDS_KEY,
       );
       Application.setState(
@@ -4316,7 +4365,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     const normalizedQuery = this.normalizeQueryString(query);
     const cacheKey = `${sort}|${page}|${normalizedQuery}`;
     const cached = this.searchCache.get(cacheKey);
-    if (!options?.forceRefresh && cached && Date.now() - cached.ts < this.getSearchCacheTtl(cacheKey)) {
+    if (
+      !options?.forceRefresh &&
+      cached &&
+      (cached.response.result?.length ?? 0) > 0 &&
+      Date.now() - cached.ts < this.getSearchCacheTtl(cacheKey)
+    ) {
       return this.cloneQueryResponse(cached.response);
     }
 
@@ -4337,11 +4391,18 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           this.storeTileFromListItem(item);
         }
         const hydrated = this.mapV2SearchResponseToQueryResponse(response);
-        this.searchCache.set(cacheKey, {
-          response: this.cloneQueryResponse(hydrated),
-          ts: Date.now(),
-        });
-        this.saveSearchCache();
+        // Empty responses are commonly caused by a transient API failure or
+        // rate-limit window. Do not persist them, otherwise a failed run can
+        // make every later search return empty until the cache TTL expires.
+        if ((hydrated.result?.length ?? 0) > 0) {
+          this.searchCache.set(cacheKey, {
+            response: this.cloneQueryResponse(hydrated),
+            ts: Date.now(),
+          });
+          this.saveSearchCache();
+        } else {
+          this.searchCache.delete(cacheKey);
+        }
         this.saveTileStore();
         return hydrated;
       },
@@ -6382,6 +6443,7 @@ function persistReadCache(): void {
 }
 
 function recordDisplayedTiles(items: readonly unknown[]): void {
+  const ids: (string | number)[] = [];
   for (const item of items) {
     try {
       const candidate =
@@ -6394,11 +6456,16 @@ function recordDisplayedTiles(items: readonly unknown[]): void {
           : undefined;
       const id = candidate?.mangaId ?? candidate?.id ?? candidate?.galleryId;
       if (typeof id === "string" || typeof id === "number") {
-        incrementDisplayedManga(id);
+        ids.push(id);
       }
     } catch {
       /* non-critical stats */
     }
+  }
+  try {
+    incrementDisplayedMangaBatch(ids);
+  } catch {
+    /* non-critical stats */
   }
 }
 

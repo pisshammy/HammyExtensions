@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
+import { takeEntriesWithinStateLimit } from "../shared/state";
 export interface LanguageOption {
   id: string;
   label: string;
@@ -53,6 +54,25 @@ const LEGACY_DISCOVER_SECTION_HIDDEN_KEYS = [
   "nhentai.settings.discoverSectionHidden.v1",
 ];
 
+// Application state is a persistence boundary, not an in-process cache. The
+// result mappers call these settings once per tile, so reading the bridge from
+// every getter turns one search into dozens of state accesses.
+const persistedSettingCache = new Map<string, unknown>();
+
+function getCachedSetting<T>(key: string): T | undefined {
+  if (persistedSettingCache.has(key)) {
+    return persistedSettingCache.get(key) as T | undefined;
+  }
+  const value = Application.getState(key) as T | undefined;
+  persistedSettingCache.set(key, value);
+  return value;
+}
+
+function setCachedSetting<T>(value: T, key: string): void {
+  persistedSettingCache.set(key, value);
+  Application.setState(value, key);
+}
+
 // Search filter persistence keys
 const SEARCH_FILTER_LENGTH_KEY = "nhentai.searchFilter.length";
 const SEARCH_FILTER_FAVORITES_KEY = "nhentai.searchFilter.favorites";
@@ -73,6 +93,7 @@ const STATS_DISPLAYED_DISTINCT_KEY = "nhentai.stats.displayedDistinct";
 const STATS_DISPLAYED_TOTAL_DISTINCT_KEY =
   "nhentai.stats.displayedTotalDistinct";
 const STATS_DISPLAYED_IDS_KEY = "nhentai.stats.displayedIds";
+const STATS_DISPLAYED_IDS_CHUNK_KEY = `${STATS_DISPLAYED_IDS_KEY}.chunk`;
 const STATS_SESSIONS_KEY = "nhentai.stats.sessions";
 const STATS_PAGE_COUNTS_KEY = "nhentai.stats.pageCounts";
 const STATS_TAG_COUNTS_KEY = "nhentai.stats.tagCounts";
@@ -100,6 +121,10 @@ type ReadCountEntry = { count: number; title?: string; tags?: string[] };
 type ReadCountMap = Record<string, ReadCountEntry>;
 type ScreenTimeMap = Record<string, number>; // YYYY-MM-DD -> minutes
 type DataReceivedMap = Record<string, number>; // YYYY-MM-DD -> bytes
+
+const DISPLAYED_IDS_CHUNK_BYTES = 60 * 1024;
+let displayedIdsCache: Set<string> | undefined;
+let displayedIdsChunkCount = 0;
 
 export const DEFAULT_LANGUAGE = "english";
 export const DEFAULT_EXTRA_ARGUMENTS = "";
@@ -268,10 +293,10 @@ function getCurrentDateExampleFull(format: string, char: string): string {
 export function getDateFormatOptionsWithSeparator(
   separatorId?: DateSeparatorId,
 ): { id: string; label: string }[] {
+  const selectedSeparatorId = separatorId ?? getDateSeparatorSetting();
   const sep =
-    DATE_SEPARATOR_OPTIONS.find(
-      (s) => s.id === (separatorId ?? getDateSeparatorSetting()),
-    )?.char ?? ".";
+    DATE_SEPARATOR_OPTIONS.find((s) => s.id === selectedSeparatorId)?.char ??
+    ".";
   return [
     {
       id: "mm_dd_yy",
@@ -392,7 +417,7 @@ export const LANGUAGE_OPTIONS: LanguageOption[] = [
 ];
 
 export function getLanguageSetting(): string[] {
-  const value = Application.getState(LANGUAGE_STATE_KEY);
+  const value = getCachedSetting<unknown>(LANGUAGE_STATE_KEY);
   // Handle migration from string to string[]
   if (Array.isArray(value)) {
     const languages = value.filter(
@@ -407,8 +432,8 @@ export function getLanguageSetting(): string[] {
 }
 
 export function setLanguageSetting(value: string | string[]): void {
-  const arr = Array.isArray(value) ? value : [value];
-  Application.setState(
+  const arr = Array.isArray(value) ? [...value] : [value];
+  setCachedSetting(
     arr.length > 0 ? arr : [DEFAULT_LANGUAGE],
     LANGUAGE_STATE_KEY,
   );
@@ -664,12 +689,48 @@ function getStoredStringState(key: string, fallback: string): string {
 }
 
 // Search filter persistence getters/setters
+function stateValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    return (
+      left.length === right.length &&
+      left.every((value, index) => stateValuesEqual(value, right[index]))
+    );
+  }
+  if (
+    typeof left !== "object" ||
+    left === null ||
+    typeof right !== "object" ||
+    right === null
+  ) {
+    return false;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+        stateValuesEqual(leftRecord[key], rightRecord[key]),
+    )
+  );
+}
+
+function setStateIfChanged<T>(value: T, key: string): void {
+  if (stateValuesEqual(Application.getState(key), value)) return;
+  Application.setState(value, key);
+}
+
 export function getSearchFilterLength(): string {
   return getStoredStringState(SEARCH_FILTER_LENGTH_KEY, "all");
 }
 
 export function setSearchFilterLength(value: string): void {
-  Application.setState(value, SEARCH_FILTER_LENGTH_KEY);
+  setStateIfChanged(value, SEARCH_FILTER_LENGTH_KEY);
 }
 
 export function getSearchFilterFavorites(): string {
@@ -677,7 +738,7 @@ export function getSearchFilterFavorites(): string {
 }
 
 export function setSearchFilterFavorites(value: string): void {
-  Application.setState(value, SEARCH_FILTER_FAVORITES_KEY);
+  setStateIfChanged(value, SEARCH_FILTER_FAVORITES_KEY);
 }
 
 export function getSearchFilterDate(): string {
@@ -685,7 +746,7 @@ export function getSearchFilterDate(): string {
 }
 
 export function setSearchFilterDate(value: string): void {
-  Application.setState(value, SEARCH_FILTER_DATE_KEY);
+  setStateIfChanged(value, SEARCH_FILTER_DATE_KEY);
 }
 
 export function getSearchFilterTags(): Record<string, "included" | "excluded"> {
@@ -763,6 +824,7 @@ export function resetNHentaiSettings(): void {
     SEARCH_FILTER_RELATED_LANGUAGE_KEY,
   );
   Application.setState([], SEARCH_FILTER_MANGA_SYNCED_TAGS_KEY);
+  persistedSettingCache.clear();
   // NOTE: Statistics keys are NEVER reset here — use resetAllStatistics() instead
 }
 
@@ -813,38 +875,34 @@ export function getDefaultSearchSortSetting(): NHentaiSearchSortId {
 }
 
 export function getDateFormatSetting(): DateFormatId {
-  const value = Application.getState(DATE_FORMAT_STATE_KEY) as
-    | DateFormatId
-    | undefined;
+  const value = getCachedSetting<DateFormatId>(DATE_FORMAT_STATE_KEY);
   if (value && DATE_FORMAT_OPTIONS.find((opt) => opt.id === value))
     return value;
   return DEFAULT_DATE_FORMAT;
 }
 
 export function setDateFormatSetting(value: DateFormatId): void {
-  Application.setState(value, DATE_FORMAT_STATE_KEY);
+  setCachedSetting(value, DATE_FORMAT_STATE_KEY);
 }
 
 export function getMilitaryTimeSetting(): boolean {
-  const stored = Application.getState(MILITARY_TIME_STATE_KEY);
+  const stored = getCachedSetting<unknown>(MILITARY_TIME_STATE_KEY);
   return typeof stored === "boolean" ? stored : false;
 }
 
 export function setMilitaryTimeSetting(value: boolean): void {
-  Application.setState(value, MILITARY_TIME_STATE_KEY);
+  setCachedSetting(value, MILITARY_TIME_STATE_KEY);
 }
 
 export function getDateSeparatorSetting(): DateSeparatorId {
-  const value = Application.getState(DATE_SEPARATOR_STATE_KEY) as
-    | DateSeparatorId
-    | undefined;
+  const value = getCachedSetting<DateSeparatorId>(DATE_SEPARATOR_STATE_KEY);
   if (value && DATE_SEPARATOR_OPTIONS.find((opt) => opt.id === value))
     return value;
   return DEFAULT_DATE_SEPARATOR;
 }
 
 export function setDateSeparatorSetting(value: DateSeparatorId): void {
-  Application.setState(value, DATE_SEPARATOR_STATE_KEY);
+  setCachedSetting(value, DATE_SEPARATOR_STATE_KEY);
 }
 
 export function formatDateByPattern(
@@ -852,10 +910,10 @@ export function formatDateByPattern(
   patternId: DateFormatId,
   separatorId?: DateSeparatorId,
 ): string {
+  const selectedSeparatorId = separatorId ?? getDateSeparatorSetting();
   const separator =
-    DATE_SEPARATOR_OPTIONS.find(
-      (opt) => opt.id === (separatorId ?? getDateSeparatorSetting()),
-    )?.char ?? ".";
+    DATE_SEPARATOR_OPTIONS.find((opt) => opt.id === selectedSeparatorId)?.char ??
+    ".";
 
   let format = `mm${separator}dd${separator}yy`;
   switch (patternId) {
@@ -901,12 +959,10 @@ export function formatDateByPattern(
 }
 
 export function getDisplayOptionsSetting(): DisplayOptionId[] {
-  const value = Application.getState(DISPLAY_OPTIONS_STATE_KEY) as
-    | DisplayOptionId[]
-    | undefined;
+  const value = getCachedSetting<DisplayOptionId[]>(DISPLAY_OPTIONS_STATE_KEY);
 
   // Return defaults only if nothing was ever stored
-  if (!Array.isArray(value)) return DEFAULT_DISPLAY_OPTIONS;
+  if (!Array.isArray(value)) return [...DEFAULT_DISPLAY_OPTIONS];
 
   // Filter out any invalid options that may have been saved from old versions
   const validIds = new Set(DISPLAY_OPTION_VALUES.map((opt) => opt.id));
@@ -917,7 +973,7 @@ export function getDisplayOptionsSetting(): DisplayOptionId[] {
 }
 
 export function setDisplayOptionsSetting(value: DisplayOptionId[]): void {
-  Application.setState(value, DISPLAY_OPTIONS_STATE_KEY);
+  setCachedSetting([...value], DISPLAY_OPTIONS_STATE_KEY);
 }
 
 export function getAddTagsToDescriptionSetting(): boolean {
@@ -934,18 +990,16 @@ export function setIncognitoModeSetting(value: boolean): void {
 }
 
 export function getRemoveSeparatorSpacesSetting(): boolean {
-  const stored = Application.getState(REMOVE_SEPARATOR_SPACES_STATE_KEY);
+  const stored = getCachedSetting<unknown>(REMOVE_SEPARATOR_SPACES_STATE_KEY);
   return typeof stored === "boolean" ? stored : DEFAULT_REMOVE_SEPARATOR_SPACES;
 }
 
 export function setRemoveSeparatorSpacesSetting(value: boolean): void {
-  Application.setState(value, REMOVE_SEPARATOR_SPACES_STATE_KEY);
+  setCachedSetting(value, REMOVE_SEPARATOR_SPACES_STATE_KEY);
 }
 
 export function getThumbnailQualitySetting(): ThumbnailQuality {
-  const stored = Application.getState(THUMBNAIL_QUALITY_STATE_KEY) as
-    | string
-    | undefined;
+  const stored = getCachedSetting<string>(THUMBNAIL_QUALITY_STATE_KEY);
 
   // Validate stored value
   if (stored === "low" || stored === "normal" || stored === "high") {
@@ -956,7 +1010,7 @@ export function getThumbnailQualitySetting(): ThumbnailQuality {
 }
 
 export function setThumbnailQualitySetting(value: ThumbnailQuality): void {
-  Application.setState(value, THUMBNAIL_QUALITY_STATE_KEY);
+  setCachedSetting(value, THUMBNAIL_QUALITY_STATE_KEY);
 }
 
 export function getPagesExpressionSetting(): string {
@@ -1397,7 +1451,7 @@ export function getRelatedLanguageSetting(): string {
 }
 
 export function setRelatedLanguageSetting(value: string): void {
-  Application.setState(
+  setStateIfChanged(
     value ?? DEFAULT_RELATED_LANGUAGE,
     RELATED_LANGUAGE_STATE_KEY,
   );
@@ -1426,7 +1480,7 @@ export function getSearchFilterRelatedLanguage(): string {
 }
 
 export function setSearchFilterRelatedLanguage(value: string): void {
-  Application.setState(value, SEARCH_FILTER_RELATED_LANGUAGE_KEY);
+  setStateIfChanged(value, SEARCH_FILTER_RELATED_LANGUAGE_KEY);
 }
 
 function sanitizeTagList(
@@ -1657,12 +1711,12 @@ function persistMergedSearchFilterTags(
 ): void {
   const sanitizedUserTags = sanitizeSearchFilterTags(userTags);
   const sanitizedSyncedTags = sanitizeSearchFilterTags(syncedTags);
-  Application.setState(sanitizedUserTags, SEARCH_FILTER_USER_TAGS_KEY);
-  Application.setState(
+  setStateIfChanged(sanitizedUserTags, SEARCH_FILTER_USER_TAGS_KEY);
+  setStateIfChanged(
     Object.keys(sanitizedSyncedTags),
     SEARCH_FILTER_MANGA_SYNCED_TAGS_KEY,
   );
-  Application.setState(
+  setStateIfChanged(
     {
       ...sanitizedUserTags,
       ...sanitizedSyncedTags,
@@ -1819,38 +1873,99 @@ export function getDisplayedMangaCount(): number {
 }
 
 export function incrementDisplayedManga(mangaId?: string | number): void {
-  if (!getStatsTrackingEnabledSetting()) return;
-  Application.setState(getDisplayedMangaCount() + 1, STATS_DISPLAYED_MANGA_KEY);
+  incrementDisplayedMangaBatch(mangaId === undefined ? [] : [String(mangaId)]);
+}
 
-  if (!mangaId) return;
-  const normalizedId = String(mangaId);
-  const ids = getDisplayedIds();
-  const isNew = !ids.has(normalizedId);
-  if (isNew) {
-    ids.add(normalizedId);
-    persistDisplayedIds(ids);
-    Application.setState(
-      getDisplayedDistinctTotal() + 1,
-      STATS_DISPLAYED_TOTAL_DISTINCT_KEY,
-    );
-  }
+export function incrementDisplayedMangaBatch(
+  mangaIds: readonly (string | number)[],
+): void {
+  if (!getStatsTrackingEnabledSetting()) return;
+  const validIds = mangaIds
+    .map((id) => String(id))
+    .filter((id) => id.length > 0);
+  if (validIds.length === 0) return;
+
   Application.setState(
-    getDisplayedDistinctTotal(),
-    STATS_DISPLAYED_DISTINCT_KEY,
+    getDisplayedMangaCount() + validIds.length,
+    STATS_DISPLAYED_MANGA_KEY,
   );
+
+  const ids = getDisplayedIds();
+  let newCount = 0;
+  for (const id of validIds) {
+    if (ids.has(id)) continue;
+    ids.add(id);
+    newCount++;
+  }
+  const nextDistinctTotal = getDisplayedDistinctTotal() + newCount;
+  if (newCount > 0) {
+    persistDisplayedIds(ids);
+    Application.setState(nextDistinctTotal, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
+  }
+  Application.setState(nextDistinctTotal, STATS_DISPLAYED_DISTINCT_KEY);
 }
 
 function getDisplayedIds(): Set<string> {
+  if (displayedIdsCache) return displayedIdsCache;
+
   const raw = Application.getState(STATS_DISPLAYED_IDS_KEY) as
     | string[]
+    | { version?: number; chunks?: number }
     | undefined;
-  if (Array.isArray(raw)) return new Set(raw);
-  return new Set();
+  const ids = new Set<string>();
+  if (Array.isArray(raw)) {
+    for (const id of raw) {
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+    displayedIdsCache = ids;
+    persistDisplayedIds(ids);
+  } else if (raw && raw.version === 2 && typeof raw.chunks === "number") {
+    displayedIdsChunkCount = Math.max(0, Math.trunc(raw.chunks));
+    for (let index = 0; index < displayedIdsChunkCount; index++) {
+      const chunk = Application.getState(
+        `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`,
+      ) as string[] | undefined;
+      if (!Array.isArray(chunk)) continue;
+      for (const id of chunk) {
+        if (typeof id === "string" && id.length > 0) ids.add(id);
+      }
+    }
+  }
+  displayedIdsCache = ids;
+  return ids;
 }
 
 function persistDisplayedIds(ids: Set<string>): void {
-  // Keep the full distinct history so the counter can grow beyond the old cap.
-  Application.setState(Array.from(ids), STATS_DISPLAYED_IDS_KEY);
+  // Keep the full distinct history, but split it into safe-sized state values.
+  const values = Array.from(ids);
+  const chunks: string[][] = [];
+  let remaining = values;
+  while (remaining.length > 0) {
+    const chunk = takeEntriesWithinStateLimit(
+      remaining,
+      (candidate) => candidate,
+      DISPLAYED_IDS_CHUNK_BYTES,
+    );
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    remaining = remaining.slice(chunk.length);
+  }
+
+  for (let index = chunks.length; index < displayedIdsChunkCount; index++) {
+    Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
+  }
+  for (let index = 0; index < chunks.length; index++) {
+    Application.setState(
+      chunks[index],
+      `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`,
+    );
+  }
+  displayedIdsChunkCount = chunks.length;
+  Application.setState(
+    { version: 2, chunks: chunks.length },
+    STATS_DISPLAYED_IDS_KEY,
+  );
+  displayedIdsCache = ids;
 }
 
 function getDisplayedDistinctTotal(): number {
@@ -2038,7 +2153,11 @@ export function incrementMarkReadOnDescCount(): void {
   );
 }
 
+let readCountMapCache: ReadCountMap | undefined;
+
 function getReadCountMap(): ReadCountMap {
+  if (readCountMapCache !== undefined) return { ...readCountMapCache };
+
   const raw = Application.getState(STATS_READ_COUNT_MAP_KEY) as
     | Record<string, unknown>
     | undefined;
@@ -2058,7 +2177,8 @@ function getReadCountMap(): ReadCountMap {
       };
     }
   }
-  return normalized;
+  readCountMapCache = normalized;
+  return { ...normalized };
 }
 
 function persistReadCountMap(map: ReadCountMap): void {
@@ -2066,10 +2186,15 @@ function persistReadCountMap(map: ReadCountMap): void {
     .filter(([, v]) => v && typeof v.count === "number" && v.count > 0)
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, 500);
+  const bounded = takeEntriesWithinStateLimit(
+    sorted,
+    (entries) => Object.fromEntries(entries),
+  );
   const trimmed: ReadCountMap = {};
-  for (const [id, value] of sorted) {
+  for (const [id, value] of bounded) {
     trimmed[id] = value;
   }
+  readCountMapCache = trimmed;
   Application.setState(trimmed, STATS_READ_COUNT_MAP_KEY);
 }
 
@@ -2251,20 +2376,56 @@ function toLocalStatsDateKey(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
+const DATA_RECEIVED_FLUSH_DELAY_MS = 250;
+let dataReceivedTotalCache: number | undefined;
+let dataReceivedDailyCache: DataReceivedMap | undefined;
+let dataReceivedFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let dataReceivedDirty = false;
+
+function scheduleDataReceivedFlush(): void {
+  if (dataReceivedFlushTimer !== undefined) return;
+  dataReceivedFlushTimer = setTimeout(() => {
+    dataReceivedFlushTimer = undefined;
+    if (!dataReceivedDirty) return;
+    dataReceivedDirty = false;
+    if (dataReceivedTotalCache !== undefined) {
+      Application.setState(dataReceivedTotalCache, STATS_DATA_RECEIVED_KEY);
+    }
+    if (dataReceivedDailyCache !== undefined) {
+      Application.setState(
+        dataReceivedDailyCache,
+        STATS_DATA_RECEIVED_DAILY_KEY,
+      );
+    }
+  }, DATA_RECEIVED_FLUSH_DELAY_MS);
+}
+
 export function getDataReceived(): number {
+  if (dataReceivedTotalCache !== undefined) return dataReceivedTotalCache;
   const val = Application.getState(STATS_DATA_RECEIVED_KEY);
-  if (typeof val === "number") return val;
-  if (typeof val === "boolean") return val ? 1 : 0;
-  if (typeof val === "string") return parseInt(val, 10) || 0;
-  return 0;
+  const parsed =
+    typeof val === "number"
+      ? val
+      : typeof val === "boolean"
+        ? val
+          ? 1
+          : 0
+        : typeof val === "string"
+          ? parseInt(val, 10) || 0
+          : 0;
+  dataReceivedTotalCache = parsed;
+  return parsed;
 }
 
 function getDataReceivedMap(): DataReceivedMap {
+  if (dataReceivedDailyCache !== undefined) {
+    return { ...dataReceivedDailyCache };
+  }
   const raw = Application.getState(STATS_DATA_RECEIVED_DAILY_KEY) as
     | DataReceivedMap
     | undefined;
-  if (raw && typeof raw === "object") return { ...raw };
-  return {};
+  dataReceivedDailyCache = raw && typeof raw === "object" ? { ...raw } : {};
+  return { ...dataReceivedDailyCache };
 }
 
 export function getDataReceivedToday(): number {
@@ -2285,13 +2446,16 @@ function persistDataReceivedMap(map: DataReceivedMap): void {
       trimmed[date] = bytes;
     }
   }
-  Application.setState(trimmed, STATS_DATA_RECEIVED_DAILY_KEY);
+  dataReceivedDailyCache = trimmed;
+  dataReceivedDirty = true;
+  scheduleDataReceivedFlush();
 }
 
 export function addDataReceived(bytes: number): void {
   if (!getStatsTrackingEnabledSetting()) return;
   if (bytes > 0) {
-    Application.setState(getDataReceived() + bytes, STATS_DATA_RECEIVED_KEY);
+    dataReceivedTotalCache = getDataReceived() + bytes;
+    dataReceivedDirty = true;
     const map = getDataReceivedMap();
     const today = toLocalStatsDateKey();
     map[today] = (map[today] ?? 0) + bytes;
@@ -2430,14 +2594,12 @@ export function setScreenTimeEnabledSetting(enabled: boolean): void {
 }
 
 export function getStatsTrackingEnabledSetting(): boolean {
-  const value = Application.getState(STATS_TRACKING_ENABLED_KEY) as
-    | boolean
-    | undefined;
+  const value = getCachedSetting<boolean>(STATS_TRACKING_ENABLED_KEY);
   return value !== false;
 }
 
 export function setStatsTrackingEnabledSetting(enabled: boolean): void {
-  Application.setState(enabled, STATS_TRACKING_ENABLED_KEY);
+  setCachedSetting(enabled, STATS_TRACKING_ENABLED_KEY);
 }
 
 export function getScreenTimeMode(): "week" | "day" {
@@ -2544,13 +2706,26 @@ export function resetAllStatistics(): void {
   Application.setState(0, STATS_DISPLAYED_DISTINCT_KEY);
   Application.setState(0, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
   Application.setState(undefined, STATS_DISPLAYED_IDS_KEY);
+  for (let index = 0; index < displayedIdsChunkCount; index++) {
+    Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
+  }
+  displayedIdsCache = undefined;
+  displayedIdsChunkCount = 0;
   Application.setState(undefined, STATS_SESSIONS_KEY);
   Application.setState(undefined, STATS_PAGE_COUNTS_KEY);
   Application.setState(undefined, STATS_TAG_COUNTS_KEY);
   Application.setState(0, STATS_TOTAL_READ_KEY);
+  if (dataReceivedFlushTimer !== undefined) {
+    clearTimeout(dataReceivedFlushTimer);
+    dataReceivedFlushTimer = undefined;
+  }
+  dataReceivedDirty = false;
+  dataReceivedTotalCache = undefined;
+  dataReceivedDailyCache = undefined;
   Application.setState(undefined, STATS_DATA_RECEIVED_KEY);
   Application.setState(undefined, STATS_DATA_RECEIVED_DAILY_KEY);
   Application.setState(undefined, STATS_READ_COUNT_MAP_KEY);
+  readCountMapCache = undefined;
   Application.setState(undefined, STATS_REREAD_TIMESTAMPS_KEY);
   Application.setState(undefined, STATS_SCREEN_TIME_KEY);
   Application.setState(undefined, STATS_STREAK_GRACE_KEY);

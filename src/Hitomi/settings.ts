@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 import { SearchFilter } from "@paperback/types/lib/compat/0.8/searchFilters";
+import { takeEntriesWithinStateLimit } from "../shared/state";
 
 export type LanguageId =
   | "all"
@@ -70,6 +71,25 @@ const LEGACY_DISCOVER_SECTION_HIDDEN_KEYS = [
   "hitomi.settings.discoverSectionHidden",
   "hitomi.settings.discoverSectionHidden.v1",
 ];
+
+// Application state is a persistence boundary, not an in-process cache. The
+// result mappers call these settings once per tile, so reading the bridge from
+// every getter turns one search into dozens of state accesses.
+const persistedSettingCache = new Map<string, unknown>();
+
+function getCachedSetting<T>(key: string): T | undefined {
+  if (persistedSettingCache.has(key)) {
+    return persistedSettingCache.get(key) as T | undefined;
+  }
+  const value = Application.getState(key) as T | undefined;
+  persistedSettingCache.set(key, value);
+  return value;
+}
+
+function setCachedSetting<T>(value: T, key: string): void {
+  persistedSettingCache.set(key, value);
+  Application.setState(value, key);
+}
 const DISCOVER_CAROUSEL_TILES_KEY = "hitomi.settings.discoverCarouselTiles";
 const DISCOVER_PAGE_TILES_KEY = "hitomi.settings.discoverPageTiles";
 const SEARCH_PAGE_TILES_KEY = "hitomi.settings.searchPageTiles";
@@ -80,6 +100,7 @@ const STATS_DISPLAYED_MANGA_KEY = "hitomi.stats.displayedManga";
 const STATS_DISPLAYED_DISTINCT_KEY = "hitomi.stats.displayedDistinct";
 const STATS_DISPLAYED_TOTAL_DISTINCT_KEY = "hitomi.stats.displayedTotalDistinct";
 const STATS_DISPLAYED_IDS_KEY = "hitomi.stats.displayedIds";
+const STATS_DISPLAYED_IDS_CHUNK_KEY = `${STATS_DISPLAYED_IDS_KEY}.chunk`;
 const STATS_SESSIONS_KEY = "hitomi.stats.sessions";
 const STATS_PAGE_COUNTS_KEY = "hitomi.stats.pageCounts";
 const STATS_TAG_COUNTS_KEY = "hitomi.stats.tagCounts";
@@ -101,6 +122,10 @@ type ReadCountEntry = { count: number; title?: string; tags?: string[] };
 type ReadCountMap = Record<string, ReadCountEntry>;
 type ScreenTimeMap = Record<string, number>; // YYYY-MM-DD -> minutes
 type DataReceivedMap = Record<string, number>; // YYYY-MM-DD -> bytes
+
+const DISPLAYED_IDS_CHUNK_BYTES = 60 * 1024;
+let displayedIdsCache: Set<string> | undefined;
+let displayedIdsChunkCount = 0;
 
 // Search filter persistence keys
 const SEARCH_FILTER_LENGTH_KEY = "hitomi.searchFilter.length";
@@ -154,10 +179,10 @@ function getCurrentDateExampleFull(format: string, char: string): string {
 export function getDateFormatOptionsWithSeparator(
   separatorId?: DateSeparatorId,
 ): { id: string; label: string }[] {
+  const selectedSeparatorId = separatorId ?? getDateSeparatorSetting();
   const sep =
-    DATE_SEPARATOR_OPTIONS.find(
-      (s) => s.id === (separatorId ?? getDateSeparatorSetting()),
-    )?.char ?? ".";
+    DATE_SEPARATOR_OPTIONS.find((s) => s.id === selectedSeparatorId)?.char ??
+    ".";
   return [
     {
       id: "mm_dd_yy",
@@ -353,14 +378,16 @@ export const TAG_CACHE_REFRESH_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
 export type DateFormatId = (typeof DATE_FORMAT_OPTIONS)[number]["id"];
 
 export function getLanguageSetting(): LanguageId[] {
-  const value = Application.getState(LANGUAGE_STATE_KEY);
-  if (Array.isArray(value) && value.length > 0) return value as LanguageId[];
+  const value = getCachedSetting<unknown>(LANGUAGE_STATE_KEY);
+  if (Array.isArray(value) && value.length > 0) {
+    return [...value] as LanguageId[];
+  }
   if (typeof value === "string") return [value as LanguageId];
   return DEFAULT_LANGUAGE;
 }
 
 export function setLanguageSetting(value: LanguageId[]) {
-  Application.setState(value, LANGUAGE_STATE_KEY);
+  setCachedSetting([...value], LANGUAGE_STATE_KEY);
 }
 
 export function getLanguageToken(id: LanguageId): string | undefined {
@@ -495,20 +522,57 @@ export function setSearchPageTilesSetting(value: number): void {
 }
 
 // Search filter persistence getters/setters
+function stateValuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    return (
+      left.length === right.length &&
+      left.every((value, index) => stateValuesEqual(value, right[index]))
+    );
+  }
+  if (
+    typeof left !== "object" ||
+    left === null ||
+    typeof right !== "object" ||
+    right === null
+  ) {
+    return false;
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const leftKeys = Object.keys(leftRecord);
+  const rightKeys = Object.keys(rightRecord);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+        stateValuesEqual(leftRecord[key], rightRecord[key]),
+    )
+  );
+}
+
+function setStateIfChanged<T>(value: T, key: string): boolean {
+  if (stateValuesEqual(Application.getState(key), value)) return false;
+  Application.setState(value, key);
+  return true;
+}
+
 export function getSearchFilterLength(): string {
   return (Application.getState(SEARCH_FILTER_LENGTH_KEY) as string) ?? "all";
 }
 
-export function setSearchFilterLength(value: string): void {
-  Application.setState(value, SEARCH_FILTER_LENGTH_KEY);
+export function setSearchFilterLength(value: string): boolean {
+  return setStateIfChanged(value, SEARCH_FILTER_LENGTH_KEY);
 }
 
 export function getSearchFilterDate(): string {
   return (Application.getState(SEARCH_FILTER_DATE_KEY) as string) ?? "all";
 }
 
-export function setSearchFilterDate(value: string): void {
-  Application.setState(value, SEARCH_FILTER_DATE_KEY);
+export function setSearchFilterDate(value: string): boolean {
+  return setStateIfChanged(value, SEARCH_FILTER_DATE_KEY);
 }
 
 export function getSearchFilterTags(): Record<string, "included" | "excluded"> {
@@ -545,8 +609,8 @@ export function getSearchFilterTags(): Record<string, "included" | "excluded"> {
 
 export function setSearchFilterTags(
   value: Record<string, "included" | "excluded">,
-): void {
-  Application.setState(value, SEARCH_FILTER_TAGS_KEY);
+): boolean {
+  return setStateIfChanged(value, SEARCH_FILTER_TAGS_KEY);
 }
 
 export function getExtraArgsSetting(): string {
@@ -703,15 +767,13 @@ export function setPagesExpressionSetting(value: string) {
 }
 
 export function getThumbnailQualitySetting(): ThumbnailQuality {
-  const stored = Application.getState(THUMBNAIL_QUALITY_KEY) as
-    | string
-    | undefined;
+  const stored = getCachedSetting<string>(THUMBNAIL_QUALITY_KEY);
   if (stored === "low" || stored === "high") return stored;
   return "high";
 }
 
 export function setThumbnailQualitySetting(value: ThumbnailQuality) {
-  Application.setState(value, THUMBNAIL_QUALITY_KEY);
+  setCachedSetting(value, THUMBNAIL_QUALITY_KEY);
 }
 
 export function getAddTagsToDescriptionSetting(): boolean {
@@ -737,13 +799,11 @@ export function setPromoteTagsSetting(value: boolean) {
 }
 
 export function getDateFormatSetting(): DateFormatId {
-  const value = Application.getState(DATE_FORMAT_STATE_KEY) as
-    | DateFormatId
-    | undefined;
+  const value = getCachedSetting<DateFormatId>(DATE_FORMAT_STATE_KEY);
   if (value && DATE_FORMAT_OPTIONS.find((opt) => opt.id === value))
     return value;
   if (value && (value.includes("_") || value.includes("."))) {
-    Application.setState(DEFAULT_DATE_FORMAT, DATE_FORMAT_STATE_KEY);
+    setCachedSetting(DEFAULT_DATE_FORMAT, DATE_FORMAT_STATE_KEY);
   }
   return DEFAULT_DATE_FORMAT;
 }
@@ -800,20 +860,18 @@ export function setDateMaxDaysSetting(value: number | undefined) {
 }
 
 export function setDateFormatSetting(value: DateFormatId) {
-  Application.setState(value, DATE_FORMAT_STATE_KEY);
+  setCachedSetting(value, DATE_FORMAT_STATE_KEY);
 }
 
 export function getDateSeparatorSetting(): DateSeparatorId {
-  const value = Application.getState(DATE_SEPARATOR_STATE_KEY) as
-    | DateSeparatorId
-    | undefined;
+  const value = getCachedSetting<DateSeparatorId>(DATE_SEPARATOR_STATE_KEY);
   if (value && DATE_SEPARATOR_OPTIONS.find((opt) => opt.id === value))
     return value;
   return DEFAULT_DATE_SEPARATOR;
 }
 
 export function setDateSeparatorSetting(value: DateSeparatorId) {
-  Application.setState(value, DATE_SEPARATOR_STATE_KEY);
+  setCachedSetting(value, DATE_SEPARATOR_STATE_KEY);
 }
 
 export function getViewedHistory(): string[] {
@@ -838,9 +896,7 @@ export function resetViewedHistory() {
 }
 
 export function getDisplayOptionsSetting(): DisplayOptionId[] {
-  const stored = Application.getState(DISPLAY_OPTIONS_STATE_KEY) as
-    | DisplayOptionId[]
-    | undefined;
+  const stored = getCachedSetting<DisplayOptionId[]>(DISPLAY_OPTIONS_STATE_KEY);
 
   // Return defaults only if nothing was ever stored
   if (!Array.isArray(stored)) return [...DEFAULT_DISPLAY_OPTIONS];
@@ -854,7 +910,7 @@ export function getDisplayOptionsSetting(): DisplayOptionId[] {
 }
 
 export function setDisplayOptionsSetting(value: DisplayOptionId[]) {
-  Application.setState(value, DISPLAY_OPTIONS_STATE_KEY);
+  setCachedSetting([...value], DISPLAY_OPTIONS_STATE_KEY);
 }
 
 export function getEnableRelatedSetting(): boolean {
@@ -896,7 +952,7 @@ export function getDefaultSearchSortSetting(): HitomiSearchSortId {
 }
 
 export function getPreferredImageFormatSetting(): PreferredImageFormat {
-  const value = Application.getState(PREFERRED_IMAGE_FORMAT_STATE_KEY);
+  const value = getCachedSetting<unknown>(PREFERRED_IMAGE_FORMAT_STATE_KEY);
   if (value === "webp" || value === "webp-auto") return "webp";
   if (value === "avif" || value === "auto") return "avif";
   return DEFAULT_PREFERRED_IMAGE_FORMAT;
@@ -905,7 +961,7 @@ export function getPreferredImageFormatSetting(): PreferredImageFormat {
 export function setPreferredImageFormatSetting(
   value: PreferredImageFormat,
 ): void {
-  Application.setState(value, PREFERRED_IMAGE_FORMAT_STATE_KEY);
+  setCachedSetting(value, PREFERRED_IMAGE_FORMAT_STATE_KEY);
 }
 
 export function resetHitomiSettings() {
@@ -956,6 +1012,7 @@ export function resetHitomiSettings() {
   Application.setState("all", SEARCH_FILTER_DATE_KEY);
   Application.setState({}, SEARCH_FILTER_TAGS_KEY);
   Application.setState([], SEARCH_FILTER_MANGA_SYNCED_TAGS_KEY);
+  persistedSettingCache.clear();
   // NOTE: Statistics keys are NEVER reset here — use resetAllStatistics() instead
 }
 
@@ -964,10 +1021,10 @@ export function formatDateByPattern(
   patternId: DateFormatId,
   separatorId?: DateSeparatorId,
 ): string {
+  const selectedSeparatorId = separatorId ?? getDateSeparatorSetting();
   const separator =
-    DATE_SEPARATOR_OPTIONS.find(
-      (opt) => opt.id === (separatorId ?? getDateSeparatorSetting()),
-    )?.char ?? ".";
+    DATE_SEPARATOR_OPTIONS.find((opt) => opt.id === selectedSeparatorId)?.char ??
+    ".";
 
   let format = `mm${separator}dd${separator}yy`;
   switch (patternId) {
@@ -1172,12 +1229,12 @@ export function setIncognitoModeSetting(value: boolean): void {
 }
 
 export function getRemoveSeparatorSpacesSetting(): boolean {
-  const stored = Application.getState(REMOVE_SEPARATOR_SPACES_STATE_KEY);
+  const stored = getCachedSetting<unknown>(REMOVE_SEPARATOR_SPACES_STATE_KEY);
   return typeof stored === "boolean" ? stored : DEFAULT_REMOVE_SEPARATOR_SPACES;
 }
 
 export function setRemoveSeparatorSpacesSetting(value: boolean): void {
-  Application.setState(value, REMOVE_SEPARATOR_SPACES_STATE_KEY);
+  setCachedSetting(value, REMOVE_SEPARATOR_SPACES_STATE_KEY);
 }
 
 function sanitizeTagList(
@@ -1473,34 +1530,97 @@ export function getDisplayedMangaCount(): number {
 }
 
 export function incrementDisplayedManga(mangaId?: string): void {
-  if (!getStatsTrackingEnabledSetting()) return;
-  Application.setState(getDisplayedMangaCount() + 1, STATS_DISPLAYED_MANGA_KEY);
+  incrementDisplayedMangaBatch(mangaId ? [mangaId] : []);
+}
 
-  if (!mangaId) return;
+export function incrementDisplayedMangaBatch(
+  mangaIds: readonly string[],
+): void {
+  if (!getStatsTrackingEnabledSetting()) return;
+  const validIds = mangaIds.filter((id) => typeof id === "string" && id.length > 0);
+  if (validIds.length === 0) return;
+
+  Application.setState(
+    getDisplayedMangaCount() + validIds.length,
+    STATS_DISPLAYED_MANGA_KEY,
+  );
+
   const ids = getDisplayedIds();
-  const isNew = !ids.has(mangaId);
-  if (isNew) {
-    ids.add(mangaId);
-    persistDisplayedIds(ids);
-    Application.setState(
-      getDisplayedDistinctTotal() + 1,
-      STATS_DISPLAYED_TOTAL_DISTINCT_KEY,
-    );
+  let newCount = 0;
+  for (const id of validIds) {
+    if (ids.has(id)) continue;
+    ids.add(id);
+    newCount++;
   }
-  Application.setState(getDisplayedDistinctTotal(), STATS_DISPLAYED_DISTINCT_KEY);
+  const nextDistinctTotal = getDisplayedDistinctTotal() + newCount;
+  if (newCount > 0) {
+    persistDisplayedIds(ids);
+    Application.setState(nextDistinctTotal, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
+  }
+  Application.setState(nextDistinctTotal, STATS_DISPLAYED_DISTINCT_KEY);
 }
 
 function getDisplayedIds(): Set<string> {
+  if (displayedIdsCache) return displayedIdsCache;
+
   const raw = Application.getState(STATS_DISPLAYED_IDS_KEY) as
     | string[]
+    | { version?: number; chunks?: number }
     | undefined;
-  if (Array.isArray(raw)) return new Set(raw);
-  return new Set();
+  const ids = new Set<string>();
+  if (Array.isArray(raw)) {
+    for (const id of raw) {
+      if (typeof id === "string" && id.length > 0) ids.add(id);
+    }
+    displayedIdsCache = ids;
+    persistDisplayedIds(ids);
+  } else if (raw && raw.version === 2 && typeof raw.chunks === "number") {
+    displayedIdsChunkCount = Math.max(0, Math.trunc(raw.chunks));
+    for (let index = 0; index < displayedIdsChunkCount; index++) {
+      const chunk = Application.getState(
+        `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`,
+      ) as string[] | undefined;
+      if (!Array.isArray(chunk)) continue;
+      for (const id of chunk) {
+        if (typeof id === "string" && id.length > 0) ids.add(id);
+      }
+    }
+  }
+  displayedIdsCache = ids;
+  return ids;
 }
 
 function persistDisplayedIds(ids: Set<string>): void {
-  // Keep the full distinct history so the counter can grow beyond the old cap.
-  Application.setState(Array.from(ids), STATS_DISPLAYED_IDS_KEY);
+  // Keep the full distinct history, but split it into safe-sized state values.
+  const values = Array.from(ids);
+  const chunks: string[][] = [];
+  let remaining = values;
+  while (remaining.length > 0) {
+    const chunk = takeEntriesWithinStateLimit(
+      remaining,
+      (candidate) => candidate,
+      DISPLAYED_IDS_CHUNK_BYTES,
+    );
+    if (chunk.length === 0) break;
+    chunks.push(chunk);
+    remaining = remaining.slice(chunk.length);
+  }
+
+  for (let index = chunks.length; index < displayedIdsChunkCount; index++) {
+    Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
+  }
+  for (let index = 0; index < chunks.length; index++) {
+    Application.setState(
+      chunks[index],
+      `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`,
+    );
+  }
+  displayedIdsChunkCount = chunks.length;
+  Application.setState(
+    { version: 2, chunks: chunks.length },
+    STATS_DISPLAYED_IDS_KEY,
+  );
+  displayedIdsCache = ids;
 }
 
 function getDisplayedDistinctTotal(): number {
@@ -1691,24 +1811,33 @@ export function incrementMarkReadOnDescCount(): void {
   );
 }
 
+let readCountMapCache: ReadCountMap | undefined;
+
 function getReadCountMap(): ReadCountMap {
+  if (readCountMapCache !== undefined) return { ...readCountMapCache };
+
   const raw = Application.getState(STATS_READ_COUNT_MAP_KEY) as
     | ReadCountMap
     | undefined;
-  if (raw && typeof raw === "object") return { ...raw };
-  return {};
+  readCountMapCache = raw && typeof raw === "object" ? { ...raw } : {};
+  return { ...readCountMapCache };
 }
 
 function persistReadCountMap(map: ReadCountMap): void {
-  // Keep only top 500 entries by count to prevent unbounded growth
+  // Keep only top 500 entries by count and stay below the state bridge limit.
   const sorted = Object.entries(map)
     .filter(([, v]) => v && typeof v.count === "number" && v.count > 0)
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, 500);
+  const bounded = takeEntriesWithinStateLimit(
+    sorted,
+    (entries) => Object.fromEntries(entries),
+  );
   const trimmed: ReadCountMap = {};
-  for (const [id, value] of sorted) {
+  for (const [id, value] of bounded) {
     trimmed[id] = value;
   }
+  readCountMapCache = trimmed;
   Application.setState(trimmed, STATS_READ_COUNT_MAP_KEY);
 }
 
@@ -1890,20 +2019,56 @@ function toLocalStatsDateKey(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
+const DATA_RECEIVED_FLUSH_DELAY_MS = 250;
+let dataReceivedTotalCache: number | undefined;
+let dataReceivedDailyCache: DataReceivedMap | undefined;
+let dataReceivedFlushTimer: ReturnType<typeof setTimeout> | undefined;
+let dataReceivedDirty = false;
+
+function scheduleDataReceivedFlush(): void {
+  if (dataReceivedFlushTimer !== undefined) return;
+  dataReceivedFlushTimer = setTimeout(() => {
+    dataReceivedFlushTimer = undefined;
+    if (!dataReceivedDirty) return;
+    dataReceivedDirty = false;
+    if (dataReceivedTotalCache !== undefined) {
+      Application.setState(dataReceivedTotalCache, STATS_DATA_RECEIVED_KEY);
+    }
+    if (dataReceivedDailyCache !== undefined) {
+      Application.setState(
+        dataReceivedDailyCache,
+        STATS_DATA_RECEIVED_DAILY_KEY,
+      );
+    }
+  }, DATA_RECEIVED_FLUSH_DELAY_MS);
+}
+
 export function getDataReceived(): number {
+  if (dataReceivedTotalCache !== undefined) return dataReceivedTotalCache;
   const val = Application.getState(STATS_DATA_RECEIVED_KEY);
-  if (typeof val === "number") return val;
-  if (typeof val === "boolean") return val ? 1 : 0;
-  if (typeof val === "string") return parseInt(val, 10) || 0;
-  return 0;
+  const parsed =
+    typeof val === "number"
+      ? val
+      : typeof val === "boolean"
+        ? val
+          ? 1
+          : 0
+        : typeof val === "string"
+          ? parseInt(val, 10) || 0
+          : 0;
+  dataReceivedTotalCache = parsed;
+  return parsed;
 }
 
 function getDataReceivedMap(): DataReceivedMap {
+  if (dataReceivedDailyCache !== undefined) {
+    return { ...dataReceivedDailyCache };
+  }
   const raw = Application.getState(STATS_DATA_RECEIVED_DAILY_KEY) as
     | DataReceivedMap
     | undefined;
-  if (raw && typeof raw === "object") return { ...raw };
-  return {};
+  dataReceivedDailyCache = raw && typeof raw === "object" ? { ...raw } : {};
+  return { ...dataReceivedDailyCache };
 }
 
 export function getDataReceivedToday(): number {
@@ -1924,13 +2089,16 @@ function persistDataReceivedMap(map: DataReceivedMap): void {
       trimmed[date] = bytes;
     }
   }
-  Application.setState(trimmed, STATS_DATA_RECEIVED_DAILY_KEY);
+  dataReceivedDailyCache = trimmed;
+  dataReceivedDirty = true;
+  scheduleDataReceivedFlush();
 }
 
 export function addDataReceived(bytes: number): void {
   if (!getStatsTrackingEnabledSetting()) return;
   if (bytes > 0) {
-    Application.setState(getDataReceived() + bytes, STATS_DATA_RECEIVED_KEY);
+    dataReceivedTotalCache = getDataReceived() + bytes;
+    dataReceivedDirty = true;
     const map = getDataReceivedMap();
     const today = toLocalStatsDateKey();
     map[today] = (map[today] ?? 0) + bytes;
@@ -2072,14 +2240,12 @@ export function setScreenTimeEnabledSetting(enabled: boolean): void {
 }
 
 export function getStatsTrackingEnabledSetting(): boolean {
-  const value = Application.getState(STATS_TRACKING_ENABLED_KEY) as
-    | boolean
-    | undefined;
+  const value = getCachedSetting<boolean>(STATS_TRACKING_ENABLED_KEY);
   return value !== false;
 }
 
 export function setStatsTrackingEnabledSetting(enabled: boolean): void {
-  Application.setState(enabled, STATS_TRACKING_ENABLED_KEY);
+  setCachedSetting(enabled, STATS_TRACKING_ENABLED_KEY);
 }
 
 export function getScreenTimeMode(): "week" | "day" {
@@ -2182,13 +2348,26 @@ export function resetAllStatistics(): void {
   Application.setState(undefined, STATS_DISPLAYED_DISTINCT_KEY);
   Application.setState(undefined, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
   Application.setState(undefined, STATS_DISPLAYED_IDS_KEY);
+  for (let index = 0; index < displayedIdsChunkCount; index++) {
+    Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
+  }
+  displayedIdsCache = undefined;
+  displayedIdsChunkCount = 0;
   Application.setState(undefined, STATS_SESSIONS_KEY);
   Application.setState(undefined, STATS_PAGE_COUNTS_KEY);
   Application.setState(undefined, STATS_TAG_COUNTS_KEY);
   Application.setState(undefined, STATS_TOTAL_READ_KEY);
+  if (dataReceivedFlushTimer !== undefined) {
+    clearTimeout(dataReceivedFlushTimer);
+    dataReceivedFlushTimer = undefined;
+  }
+  dataReceivedDirty = false;
+  dataReceivedTotalCache = undefined;
+  dataReceivedDailyCache = undefined;
   Application.setState(undefined, STATS_DATA_RECEIVED_KEY);
   Application.setState(undefined, STATS_DATA_RECEIVED_DAILY_KEY);
   Application.setState(undefined, STATS_READ_COUNT_MAP_KEY);
+  readCountMapCache = undefined;
   Application.setState(undefined, STATS_REREAD_TIMESTAMPS_KEY);
   Application.setState(undefined, STATS_SCREEN_TIME_KEY);
   Application.setState(undefined, STATS_STREAK_GRACE_KEY);
