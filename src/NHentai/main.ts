@@ -48,6 +48,7 @@ import {
   DATE_FILTER_PRESETS,
   DISCOVER_TO_SORT_MAP,
   ensureInstallDate,
+  flushDataReceivedStats,
   formatDateByPattern,
   getAddTagsToDescriptionSetting,
   getAllRereadManga,
@@ -210,7 +211,13 @@ const GALLERY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const GALLERY_CACHE_MAX_SIZE = 250;
 const GALLERY_CACHE_STATE_KEY = "nhentai.galleryCache.v1";
 const TILE_STORE_STATE_KEY = "nhentai.tileStore.v1";
-const CACHE_SAVE_DEBOUNCE_MS = 250;
+// JSC has no reliable setTimeout, so saves coalesce on change counts
+// instead of a time debounce.
+const GALLERY_CACHE_SAVE_BATCH = 8;
+// Above a search/discover page (25 items) so one page's tiles are written once
+// by the explicit flushTileStore() at the end of the request, not twice (batch
+// flush plus boundary flush).
+const TILE_STORE_SAVE_BATCH = 64;
 // Keep initial discover burst to one request per section to manage rate limits.
 // With 6 discover sections (Popular, Recent, Random, etc.), this prevents burst 429s.
 const DISCOVER_FETCH_INITIAL_BATCH_SIZE = 1;
@@ -3037,11 +3044,14 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   // gallery detail requests in lite mode (no date subtitles).
   private tileStore = new Map<string, LiteGalleryTile>();
   private tileStoreDirty = false;
-  private tileStoreSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  private tileStorePendingChanges = 0;
+  // Set while restoreSearchCache bulk-loads thousands of tiles; counting each
+  // one made startup rewrite the whole store every TILE_STORE_SAVE_BATCH items.
+  private tileStoreBulkLoading = false;
   private galleryPending = new Map<string, Promise<Gallery>>();
   private galleryCache = new Map<string, GalleryCacheEntry>();
   private galleryCacheDirty = false;
-  private galleryCacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  private galleryCachePendingChanges = 0;
   private relatedPoolCache:
     | { id: number; tag: string; cycleIndex: number }[]
     | undefined;
@@ -3070,6 +3080,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
 
   private restoreSearchCache(): void {
+    this.tileStoreBulkLoading = true;
     try {
       const saved = Application.getState(SEARCH_CACHE_STATE_KEY) as
         | { entries: [string, { response: QueryResponse; ts: number }][] }
@@ -3106,7 +3117,11 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       }
     } catch {
       // Ignore restore failures
+    } finally {
+      this.tileStoreBulkLoading = false;
     }
+    // Persist the whole restored store once (no-op when nothing changed).
+    this.flushTileStore();
   }
 
   private restoreGalleryCache(): void {
@@ -3162,7 +3177,8 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       if (restored > 0) {
         console.log(`[NHentai] Restored ${restored} cached galleries`);
         if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
-          this.scheduleGalleryCacheSave();
+          this.galleryCacheDirty = true;
+          this.saveGalleryCache();
         }
       }
     } catch {
@@ -3189,10 +3205,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
   private saveGalleryCache(): void {
     if (!this.galleryCacheDirty) return;
-    if (this.galleryCacheSaveTimer !== undefined) {
-      clearTimeout(this.galleryCacheSaveTimer);
-      this.galleryCacheSaveTimer = undefined;
-    }
+    this.galleryCachePendingChanges = 0;
     try {
       const now = Date.now();
       this.pruneGalleryCache(now);
@@ -3261,11 +3274,10 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
   private scheduleGalleryCacheSave(): void {
     this.galleryCacheDirty = true;
-    if (this.galleryCacheSaveTimer !== undefined) return;
-    this.galleryCacheSaveTimer = setTimeout(() => {
-      this.galleryCacheSaveTimer = undefined;
+    this.galleryCachePendingChanges++;
+    if (this.galleryCachePendingChanges >= GALLERY_CACHE_SAVE_BATCH) {
       this.saveGalleryCache();
-    }, CACHE_SAVE_DEBOUNCE_MS);
+    }
   }
 
   private saveSearchCache(): void {
@@ -3308,7 +3320,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       }
       if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
         this.tileStoreDirty = true;
-        this.saveTileStore();
+        this.flushTileStore();
       }
     } catch {
       // Ignore restore failures
@@ -3316,17 +3328,16 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   }
 
   private saveTileStore(): void {
-    if (!this.tileStoreDirty) return;
-    if (this.tileStoreSaveTimer !== undefined) return;
-    this.tileStoreSaveTimer = setTimeout(() => {
-      this.tileStoreSaveTimer = undefined;
+    this.tileStoreDirty = true;
+    if (this.tileStoreBulkLoading) return;
+    this.tileStorePendingChanges++;
+    if (this.tileStorePendingChanges >= TILE_STORE_SAVE_BATCH) {
       this.flushTileStore();
-    }, CACHE_SAVE_DEBOUNCE_MS);
+    }
   }
 
   private flushTileStore(): void {
     if (!this.tileStoreDirty) return;
-    this.tileStoreDirty = false;
     try {
       const allEntries = [...this.tileStore.entries()];
       const entries = takeEntriesWithinStateLimit(
@@ -3334,8 +3345,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         (candidate) => candidate,
       );
       Application.setState(entries, TILE_STORE_STATE_KEY);
+      // Clear only after a successful write so a throwing bridge is retried at
+      // the next batch or boundary instead of being silently dropped.
+      this.tileStoreDirty = false;
+      this.tileStorePendingChanges = 0;
     } catch {
-      // Ignore save failures
+      // Ignore save failures; the dirty flag stays set for the next attempt.
     }
   }
 
@@ -3383,7 +3398,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           : existing?.tag_ids,
       upload_date: gallery.upload_date > 0 ? gallery.upload_date : existing?.upload_date,
     });
-    this.tileStoreDirty = true;
+    this.saveTileStore();
   }
 
   private storeTileFromListItem(item: V2GalleryListItem): void {
@@ -3397,7 +3412,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       num_favorites: item.num_favorites ?? 0,
       tag_ids: item.tag_ids,
     });
-    this.tileStoreDirty = true;
+    this.saveTileStore();
   }
 
   private buildGalleryFromTile(tile: LiteGalleryTile): Gallery {
@@ -3810,7 +3825,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         );
 
       logDebug("Loaded", relatedIds.length, "related IDs for", mangaId);
-      this.saveTileStore();
+      this.flushTileStore();
       return relatedIds;
     } catch (e) {
       if (e instanceof CloudflareError) throw e;
@@ -4403,7 +4418,8 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         } else {
           this.searchCache.delete(cacheKey);
         }
-        this.saveTileStore();
+        this.flushTileStore();
+        flushDataReceivedStats();
         return hydrated;
       },
     );
@@ -4872,8 +4888,9 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       .then((detail) => this.mapV2GalleryDetailToGallery(detail))
       .then((gallery) => {
         this.storeTileFromGallery(gallery);
-        this.saveTileStore();
+        this.flushTileStore();
         this.setCachedGallery(gallery);
+        flushDataReceivedStats();
         return gallery;
       })
       .finally(() => {

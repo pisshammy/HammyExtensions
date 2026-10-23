@@ -44,6 +44,7 @@ import {
   addToViewedHistory,
   ALL_DISCOVER_SECTIONS,
   ensureInstallDate,
+  flushDataReceivedStats,
   formatDateByPattern,
   getAddTagsToDescriptionSetting,
   getAllRereadManga,
@@ -228,7 +229,9 @@ const TAG_CACHE_LAST_FETCH_KEY = "hitomi.tagCacheLastFetch";
 const GALLERY_CACHE_STATE_KEY = "hitomi.galleryCache";
 const GALLERY_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const GALLERY_CACHE_MAX_SIZE = 300;
-const GALLERY_CACHE_SAVE_DEBOUNCE_MS = 250;
+// JSC has no reliable setTimeout, so saves coalesce on a change count
+// instead of a time debounce.
+const GALLERY_CACHE_SAVE_BATCH = 8;
 
 class InlineSearchFilterForm extends SearchFilterForm {
   override getSections() {
@@ -1521,7 +1524,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     return cache;
   })();
   private galleryCacheDirty = false;
-  private galleryCacheSaveTimer: ReturnType<typeof setTimeout> | undefined;
+  private galleryCachePendingChanges = 0;
   coverCache = new Map<string, string>();
 
   galleryPending = new Map<string, Promise<HitomiGallery>>();
@@ -1741,7 +1744,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         console.log(`[Hitomi] Restored ${restored} cached galleries`);
         if (serializedStateBytes(saved) > MAX_APPLICATION_STATE_BYTES) {
           this.galleryCacheDirty = true;
-          this.scheduleGalleryCacheSave();
+          this.saveGalleryCache();
         }
       }
     } catch {
@@ -1751,19 +1754,15 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
   private scheduleGalleryCacheSave(): void {
     this.galleryCacheDirty = true;
-    if (this.galleryCacheSaveTimer !== undefined) return;
-    this.galleryCacheSaveTimer = setTimeout(() => {
-      this.galleryCacheSaveTimer = undefined;
+    this.galleryCachePendingChanges++;
+    if (this.galleryCachePendingChanges >= GALLERY_CACHE_SAVE_BATCH) {
       this.saveGalleryCache();
-    }, GALLERY_CACHE_SAVE_DEBOUNCE_MS);
+    }
   }
 
   private saveGalleryCache(): void {
     if (!this.galleryCacheDirty) return;
-    if (this.galleryCacheSaveTimer !== undefined) {
-      clearTimeout(this.galleryCacheSaveTimer);
-      this.galleryCacheSaveTimer = undefined;
-    }
+    this.galleryCachePendingChanges = 0;
     try {
       const allEntries = this.galleryCache
         .entries()
@@ -3433,6 +3432,9 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       const actuallyHasMore =
         nextScanOffset < deduplicatedIds.length || upstreamHasMore;
       recordDisplayedTiles(finalItems);
+      // Persist stats accumulated during this search page; the volume threshold
+      // alone never fires in a browse-only session.
+      flushDataReceivedStats();
 
       // When filtering removes all items on this page but more IDs exist upstream,
       // keep pagination alive so the framework fetches the next page instead of
@@ -5244,6 +5246,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       this.galleryPending.delete(id);
     });
     this.setCachedGallery(id, gallery);
+    flushDataReceivedStats();
     return gallery;
   }
 

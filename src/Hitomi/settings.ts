@@ -1,6 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 import { SearchFilter } from "@paperback/types/lib/compat/0.8/searchFilters";
-import { takeEntriesWithinStateLimit } from "../shared/state";
+import {
+  serializedStateBytes,
+  takeEntriesWithinStateLimit,
+} from "../shared/state";
 
 export type LanguageId =
   | "all"
@@ -126,6 +129,8 @@ type DataReceivedMap = Record<string, number>; // YYYY-MM-DD -> bytes
 const DISPLAYED_IDS_CHUNK_BYTES = 60 * 1024;
 let displayedIdsCache: Set<string> | undefined;
 let displayedIdsChunkCount = 0;
+let displayedIdsChunks: string[][] = [];
+let displayedIdsRepackNeeded = false;
 
 // Search filter persistence keys
 const SEARCH_FILTER_LENGTH_KEY = "hitomi.searchFilter.length";
@@ -1546,15 +1551,15 @@ export function incrementDisplayedMangaBatch(
   );
 
   const ids = getDisplayedIds();
-  let newCount = 0;
+  const newIds: string[] = [];
   for (const id of validIds) {
     if (ids.has(id)) continue;
     ids.add(id);
-    newCount++;
+    newIds.push(id);
   }
-  const nextDistinctTotal = getDisplayedDistinctTotal() + newCount;
-  if (newCount > 0) {
-    persistDisplayedIds(ids);
+  const nextDistinctTotal = getDisplayedDistinctTotal() + newIds.length;
+  if (newIds.length > 0) {
+    appendDisplayedIds(newIds);
     Application.setState(nextDistinctTotal, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
   }
   Application.setState(nextDistinctTotal, STATS_DISPLAYED_DISTINCT_KEY);
@@ -1574,37 +1579,58 @@ function getDisplayedIds(): Set<string> {
     }
     displayedIdsCache = ids;
     persistDisplayedIds(ids);
-  } else if (raw && raw.version === 2 && typeof raw.chunks === "number") {
-    displayedIdsChunkCount = Math.max(0, Math.trunc(raw.chunks));
-    for (let index = 0; index < displayedIdsChunkCount; index++) {
+    return ids;
+  }
+  if (raw && raw.version === 2 && typeof raw.chunks === "number") {
+    const expectedChunks = Math.max(0, Math.trunc(raw.chunks));
+    displayedIdsChunkCount = expectedChunks;
+    for (let index = 0; index < expectedChunks; index++) {
       const chunk = Application.getState(
         `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`,
       ) as string[] | undefined;
       if (!Array.isArray(chunk)) continue;
+      displayedIdsChunks.push(chunk);
       for (const id of chunk) {
         if (typeof id === "string" && id.length > 0) ids.add(id);
       }
     }
+    displayedIdsCache = ids;
+    if (displayedIdsChunks.length !== expectedChunks) {
+      // A chunk key is missing or corrupt. Appends address chunks by array
+      // index, so a gap would make the next append overwrite a live chunk and
+      // silently drop its ids. Repack what loaded (which also clears the keys
+      // past the new count) instead of appending into a shifted layout.
+      persistDisplayedIds(ids);
+      return ids;
+    }
+    displayedIdsChunkCount = displayedIdsChunks.length;
+    return ids;
   }
   displayedIdsCache = ids;
   return ids;
 }
 
 function persistDisplayedIds(ids: Set<string>): void {
-  // Keep the full distinct history, but split it into safe-sized state values.
-  const values = Array.from(ids);
+  // Full repack into safe-sized state values. Only used for legacy migration
+  // and statistics reset — incremental appends go through appendDisplayedIds
+  // so loading new pages never rewrites the whole history.
   const chunks: string[][] = [];
-  let remaining = values;
-  while (remaining.length > 0) {
-    const chunk = takeEntriesWithinStateLimit(
-      remaining,
-      (candidate) => candidate,
-      DISPLAYED_IDS_CHUNK_BYTES,
-    );
-    if (chunk.length === 0) break;
-    chunks.push(chunk);
-    remaining = remaining.slice(chunk.length);
+  let current: string[] = [];
+  let currentSize = 0;
+  for (const id of ids) {
+    const idBytes = serializedStateBytes(id) + 1;
+    if (
+      current.length > 0 &&
+      currentSize + idBytes > DISPLAYED_IDS_CHUNK_BYTES
+    ) {
+      chunks.push(current);
+      current = [];
+      currentSize = 0;
+    }
+    current.push(id);
+    currentSize += idBytes;
   }
+  if (current.length > 0) chunks.push(current);
 
   for (let index = chunks.length; index < displayedIdsChunkCount; index++) {
     Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
@@ -1616,11 +1642,70 @@ function persistDisplayedIds(ids: Set<string>): void {
     );
   }
   displayedIdsChunkCount = chunks.length;
+  displayedIdsChunks = chunks;
   Application.setState(
     { version: 2, chunks: chunks.length },
     STATS_DISPLAYED_IDS_KEY,
   );
   displayedIdsCache = ids;
+}
+
+function appendDisplayedIds(newIds: readonly string[]): void {
+  // Append-only persistence: existing chunks stay untouched and only the tail
+  // chunk that received new ids is rewritten. Rewriting every chunk on each
+  // page of results made pagination visibly slower as history grew.
+  if (displayedIdsRepackNeeded && displayedIdsCache) {
+    // An earlier chunk write failed, so the persisted layout is unknown.
+    // Rebuild the whole set from memory instead of appending to indices that
+    // may no longer line up with the keys on disk.
+    persistDisplayedIds(displayedIdsCache);
+    displayedIdsRepackNeeded = false;
+    // Callers add new ids to the cached set before appending, so the repack
+    // above already contains everything this batch would have written.
+    return;
+  }
+
+  let last = displayedIdsChunks[displayedIdsChunks.length - 1];
+  let lastIndex = displayedIdsChunks.length - 1;
+  let lastBytes = last ? serializedStateBytes(last) : 0;
+  let tailDirty = false;
+
+  try {
+    for (const id of newIds) {
+      const idBytes = serializedStateBytes(id) + 1;
+      if (!last || lastBytes + idBytes > DISPLAYED_IDS_CHUNK_BYTES) {
+        if (tailDirty && last) {
+          Application.setState(
+            last,
+            `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${lastIndex}`,
+          );
+        }
+        last = [];
+        displayedIdsChunks.push(last);
+        lastIndex = displayedIdsChunks.length - 1;
+        lastBytes = 0;
+        tailDirty = false;
+        displayedIdsChunkCount = displayedIdsChunks.length;
+        Application.setState(
+          { version: 2, chunks: displayedIdsChunks.length },
+          STATS_DISPLAYED_IDS_KEY,
+        );
+      }
+      last.push(id);
+      lastBytes += idBytes;
+      tailDirty = true;
+    }
+    if (tailDirty && last) {
+      Application.setState(
+        last,
+        `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${lastIndex}`,
+      );
+    }
+  } catch {
+    // The in-memory set still holds these ids; repair the persisted chunks on
+    // the next append rather than leaving a half-written layout behind.
+    displayedIdsRepackNeeded = true;
+  }
 }
 
 function getDisplayedDistinctTotal(): number {
@@ -2019,28 +2104,58 @@ function toLocalStatsDateKey(date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
 }
 
-const DATA_RECEIVED_FLUSH_DELAY_MS = 250;
+// Timer-free coalescing for data-received stats: JSC has no reliable
+// setTimeout, so the caches flush on volume thresholds instead of time.
+const DATA_RECEIVED_FLUSH_BYTES = 256 * 1024;
+const DATA_RECEIVED_FLUSH_RESPONSES = 20;
 let dataReceivedTotalCache: number | undefined;
 let dataReceivedDailyCache: DataReceivedMap | undefined;
-let dataReceivedFlushTimer: ReturnType<typeof setTimeout> | undefined;
 let dataReceivedDirty = false;
+let dataReceivedPendingBytes = 0;
+let dataReceivedPendingResponses = 0;
+
+function flushDataReceived(): void {
+  if (!dataReceivedDirty) return;
+  if (dataReceivedTotalCache !== undefined) {
+    Application.setState(dataReceivedTotalCache, STATS_DATA_RECEIVED_KEY);
+  }
+  if (dataReceivedDailyCache !== undefined) {
+    Application.setState(
+      dataReceivedDailyCache,
+      STATS_DATA_RECEIVED_DAILY_KEY,
+    );
+  }
+  // Clear the pending counters only after both writes landed, so a failed
+  // bridge write is retried at the next boundary instead of being dropped.
+  dataReceivedDirty = false;
+  dataReceivedPendingBytes = 0;
+  dataReceivedPendingResponses = 0;
+}
 
 function scheduleDataReceivedFlush(): void {
-  if (dataReceivedFlushTimer !== undefined) return;
-  dataReceivedFlushTimer = setTimeout(() => {
-    dataReceivedFlushTimer = undefined;
-    if (!dataReceivedDirty) return;
-    dataReceivedDirty = false;
-    if (dataReceivedTotalCache !== undefined) {
-      Application.setState(dataReceivedTotalCache, STATS_DATA_RECEIVED_KEY);
+  if (
+    dataReceivedPendingResponses >= DATA_RECEIVED_FLUSH_RESPONSES ||
+    dataReceivedPendingBytes >= DATA_RECEIVED_FLUSH_BYTES
+  ) {
+    try {
+      flushDataReceived();
+    } catch {
+      // Stats writes must never break a response path; retried next time.
     }
-    if (dataReceivedDailyCache !== undefined) {
-      Application.setState(
-        dataReceivedDailyCache,
-        STATS_DATA_RECEIVED_DAILY_KEY,
-      );
-    }
-  }, DATA_RECEIVED_FLUSH_DELAY_MS);
+  }
+}
+
+/**
+ * Force pending data-received stats to disk. Called at request-batch boundaries
+ * (search page, gallery details) so a browse-only session is not lost when the
+ * volume thresholds are never reached.
+ */
+export function flushDataReceivedStats(): void {
+  try {
+    flushDataReceived();
+  } catch {
+    // Stats writes must never break a response path.
+  }
 }
 
 export function getDataReceived(): number {
@@ -2099,6 +2214,8 @@ export function addDataReceived(bytes: number): void {
   if (bytes > 0) {
     dataReceivedTotalCache = getDataReceived() + bytes;
     dataReceivedDirty = true;
+    dataReceivedPendingBytes += bytes;
+    dataReceivedPendingResponses++;
     const map = getDataReceivedMap();
     const today = toLocalStatsDateKey();
     map[today] = (map[today] ?? 0) + bytes;
@@ -2347,23 +2464,39 @@ export function resetAllStatistics(): void {
   Application.setState(undefined, STATS_DISPLAYED_MANGA_KEY);
   Application.setState(undefined, STATS_DISPLAYED_DISTINCT_KEY);
   Application.setState(undefined, STATS_DISPLAYED_TOTAL_DISTINCT_KEY);
+  const displayedIdsMarker = Application.getState(STATS_DISPLAYED_IDS_KEY) as
+    | string[]
+    | { chunks?: number }
+    | undefined;
+  const markerChunkCount =
+    displayedIdsMarker &&
+    !Array.isArray(displayedIdsMarker) &&
+    typeof displayedIdsMarker.chunks === "number"
+      ? Math.max(0, Math.trunc(displayedIdsMarker.chunks))
+      : 0;
   Application.setState(undefined, STATS_DISPLAYED_IDS_KEY);
-  for (let index = 0; index < displayedIdsChunkCount; index++) {
+  // Clear every chunk the marker knows about, even when the chunk list was
+  // never loaded this session, so no unreachable keys are left behind.
+  for (
+    let index = 0;
+    index < Math.max(displayedIdsChunkCount, markerChunkCount);
+    index++
+  ) {
     Application.setState(undefined, `${STATS_DISPLAYED_IDS_CHUNK_KEY}.${index}`);
   }
   displayedIdsCache = undefined;
   displayedIdsChunkCount = 0;
+  displayedIdsChunks = [];
+  displayedIdsRepackNeeded = false;
   Application.setState(undefined, STATS_SESSIONS_KEY);
   Application.setState(undefined, STATS_PAGE_COUNTS_KEY);
   Application.setState(undefined, STATS_TAG_COUNTS_KEY);
   Application.setState(undefined, STATS_TOTAL_READ_KEY);
-  if (dataReceivedFlushTimer !== undefined) {
-    clearTimeout(dataReceivedFlushTimer);
-    dataReceivedFlushTimer = undefined;
-  }
   dataReceivedDirty = false;
   dataReceivedTotalCache = undefined;
   dataReceivedDailyCache = undefined;
+  dataReceivedPendingBytes = 0;
+  dataReceivedPendingResponses = 0;
   Application.setState(undefined, STATS_DATA_RECEIVED_KEY);
   Application.setState(undefined, STATS_DATA_RECEIVED_DAILY_KEY);
   Application.setState(undefined, STATS_READ_COUNT_MAP_KEY);

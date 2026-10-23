@@ -4,7 +4,7 @@ import { ContentRating, ExtensionInfo, SourceIntents } from "@paperback/types";
 export default {
   name: "NHentai",
   description: "Extension that pulls content from nhentai.net",
-  version: "3.0.0",
+  version: "3.1.0",
   icon: "icon.png",
   language: "multi",
   contentRating: ContentRating.ADULT,
