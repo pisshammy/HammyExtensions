@@ -734,7 +734,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Carousel",
           value: this.discoverCarouselTiles,
           minValue: 1,
-          maxValue: 6,
+          maxValue: 12,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
@@ -746,7 +746,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Discover",
           value: this.discoverPageTiles,
           minValue: 1,
-          maxValue: 12,
+          maxValue: 16,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
