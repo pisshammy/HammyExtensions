@@ -1,5 +1,5 @@
 {
-  "buildTime": "2026-10-21T12:48:55.718Z",
+  "buildTime": "2026-10-23T18:42:24.774Z",
   "builtWith": {
     "toolchain": "1.0.0-alpha.91",
     "types": "1.0.0-alpha.91"
@@ -12,7 +12,7 @@
     {
       "name": "Hitomi",
       "description": "Extension that pulls content from hitomi.la",
-      "version": "1.9.0",
+      "version": "2.0.0",
       "icon": "icon.png",
       "language": "multi",
       "contentRating": "ADULT",
@@ -35,7 +35,7 @@
     {
       "name": "NHentai",
       "description": "Extension that pulls content from nhentai.net",
-      "version": "3.0.0",
+      "version": "3.1.0",
       "icon": "icon.png",
       "language": "multi",
       "contentRating": "ADULT",
