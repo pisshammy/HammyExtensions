@@ -829,7 +829,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Carousel",
           value: this.discoverCarouselTiles,
           minValue: 1,
-          maxValue: 16,
+          maxValue: 24,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
@@ -983,7 +983,7 @@ class MangaFiltersForm extends Form {
     this.discoverCarouselTiles = this.normalizeStepperValue(
       value,
       1,
-      16,
+      24,
       this.discoverCarouselTiles,
     );
     setDiscoverCarouselTilesSetting(this.discoverCarouselTiles);

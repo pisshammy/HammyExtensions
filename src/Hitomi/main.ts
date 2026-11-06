@@ -221,6 +221,8 @@ const READ_STATE_KEY = "hitomi.readHistory";
 const COOKIE_JAR_STATE_KEY = "hitomi.cookieJar";
 const IDSET_CACHE_STATE_KEY = "hitomi.idSetCache.v1";
 const RELATED_VIEW_COUNTS_KEY = "hitomi.relatedViewCounts";
+const RELATED_SHOWN_WINDOW_KEY = "hitomi.relatedShownWindow";
+const RELATED_RESUME_STATE_KEY = "hitomi.relatedResume";
 const TAG_CACHE_STATE_KEY = "hitomi.tagCache";
 const TAG_CACHE_VERSION = 2;
 const TAG_CACHE_VERSION_KEY = "hitomi.tagCacheVersion";
@@ -408,24 +410,30 @@ const INCREMENTAL_BATCH = 8;
 
 // Track how many times each related manga has been shown in the carousel
 let relatedViewCounts: Map<number, number> | undefined;
-const RELATED_AGE_WINDOW_TILES = 72;
+/**
+ * A related tile may not be shown again until this many related tiles have
+ * been displayed since it last appeared. The window is persisted so a fresh
+ * load (new read, restart) resumes where the user stopped scrolling instead of
+ * repeating the tiles they already scrolled past.
+ */
+const RELATED_AGE_WINDOW_TILES = 128;
 
 function getCarouselTiles(): number {
   const value = getDiscoverCarouselTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_CAROUSEL_TILES;
-  return Math.max(1, Math.min(16, Math.floor(value)));
+  return Math.max(1, Math.min(24, Math.floor(value)));
 }
 
 function getDiscoverPageSize(): number {
   const value = getDiscoverPageTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_DISCOVER_PAGE_SIZE;
-  return Math.max(1, Math.min(24, Math.floor(value)));
+  return Math.max(1, Math.min(48, Math.floor(value)));
 }
 
 function getSearchPageSize(): number {
   const value = getSearchPageTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_SEARCH_PAGE_SIZE;
-  return Math.max(1, Math.min(36, Math.floor(value)));
+  return Math.max(1, Math.min(48, Math.floor(value)));
 }
 
 function getRelatedViewCounts(): Map<number, number> {
@@ -469,6 +477,117 @@ function incrementRelatedViewCount(id: number): number {
     // Keep in-memory counters even if persistence fails.
   }
   return newCount;
+}
+
+type RelatedPoolEntry = {
+  id: number;
+  tag: string;
+  cycleIndex: number;
+  baseId?: number;
+};
+
+// Persisted FIFO of related tiles that were already displayed. Entries are
+// keyed by base manga so a tile can still show up when it belongs to another
+// read manga's relations. Tiles fall out of the window once enough later tiles
+// have been displayed.
+let relatedShownWindow: string[] | undefined;
+
+function relatedShownKey(baseId: number, id: number): string {
+  return `${baseId}:${id}`;
+}
+
+function getRelatedShownWindow(): string[] {
+  if (!relatedShownWindow) {
+    const stored = Application.getState(RELATED_SHOWN_WINDOW_KEY) as unknown;
+    relatedShownWindow = Array.isArray(stored)
+      ? stored
+        .filter((value): value is string => typeof value === "string")
+        .slice(-RELATED_AGE_WINDOW_TILES)
+      : [];
+  }
+  return relatedShownWindow;
+}
+
+// One cycle in the related feed and how many of its tiles were displayed.
+// Cycles are kept in display order. On launch only whole cycles that fit
+// inside the 128-tile window are dropped, so a feed never resumes mid-cycle.
+type RelatedCycleProgress = {
+  baseId: number;
+  shown: number;
+};
+
+type RelatedResumeState = {
+  top: number;
+  anchor: number;
+  cycles?: RelatedCycleProgress[];
+};
+
+// Persisted resume point for the related feed. `anchor` is the base manga of
+// the last cycle the user scrolled to, `top` is the newest read manga at that
+// time. A fresh load keeps the cycles that were already scrolled past hidden
+// while still surfacing manga read after `top` first.
+let relatedResumeState: RelatedResumeState | undefined;
+
+function getRelatedResumeState(): RelatedResumeState {
+  if (!relatedResumeState) {
+    const stored = Application.getState(RELATED_RESUME_STATE_KEY) as
+      | { top?: unknown; anchor?: unknown; cycles?: unknown }
+      | undefined;
+    const cycles: RelatedCycleProgress[] = [];
+    if (Array.isArray(stored?.cycles)) {
+      for (const entry of stored.cycles) {
+        if (!entry || typeof entry !== "object") continue;
+        const value = entry as { baseId?: unknown; shown?: unknown };
+        if (typeof value.baseId !== "number" || value.baseId <= 0) continue;
+        if (typeof value.shown !== "number" || value.shown <= 0) continue;
+        cycles.push({ baseId: value.baseId, shown: Math.floor(value.shown) });
+      }
+    }
+    relatedResumeState = {
+      top: typeof stored?.top === "number" ? stored.top : 0,
+      anchor: typeof stored?.anchor === "number" ? stored.anchor : 0,
+      cycles,
+    };
+  }
+  return relatedResumeState;
+}
+
+function saveRelatedResumeState(next: RelatedResumeState): void {
+  relatedResumeState = next;
+  try {
+    Application.setState(next, RELATED_RESUME_STATE_KEY);
+  } catch {
+    // Keep the in-memory state even if persistence fails.
+  }
+}
+
+// The 128-tile counter restarts on every launch, so previously displayed
+// tiles are eligible again unless their whole cycle was dropped.
+function resetRelatedShownWindow(): void {
+  relatedShownWindow = [];
+  try {
+    Application.setState([], RELATED_SHOWN_WINDOW_KEY);
+  } catch {
+    // Keep the in-memory window even if persistence fails.
+  }
+}
+
+function recordRelatedShownTiles(keys: readonly string[]): void {
+  if (keys.length === 0) return;
+  const window = getRelatedShownWindow();
+  for (const key of keys) {
+    const existing = window.indexOf(key);
+    if (existing >= 0) window.splice(existing, 1);
+    window.push(key);
+  }
+  if (window.length > RELATED_AGE_WINDOW_TILES) {
+    window.splice(0, window.length - RELATED_AGE_WINDOW_TILES);
+  }
+  try {
+    Application.setState([...window], RELATED_SHOWN_WINDOW_KEY);
+  } catch {
+    // Keep the in-memory window even if persistence fails.
+  }
 }
 
 const LANGUAGE_SHORT: Record<string, string> = {
@@ -1532,11 +1651,11 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
   // Cache for related pool to prevent re-fetching on pagination
   // Now uses lazy loading - pool grows as user scrolls
-  relatedPoolCache: { id: number; tag: string; cycleIndex: number }[] | null =
+  relatedPoolCache: RelatedPoolEntry[] | null =
     null;
+  relatedPoolLock: Promise<void> = Promise.resolve();
   relatedPoolLastHistoryIndex = 0; // Track how far we've processed into history
   relatedPoolSeenIds = new Set<number>(); // Track seen IDs across lazy loads
-  relatedPoolHistoryIds = new Set<number>(); // Track history IDs to exclude from relatedIds
   // Session-based page tracking: maps item ID → page number when first displayed
   // Used to hide items after user scrolls RELATED_VIEW_THRESHOLD pages past them
   relatedFirstSeenPage = new Map<number, number>();
@@ -1986,7 +2105,11 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       const now = Date.now();
       let restoredCount = 0;
       for (const [key, entry] of saved.entries) {
-        if (!Array.isArray(entry?.ids) || now - entry.ts > this.IDSET_TTL) {
+        if (
+          !Array.isArray(entry?.ids) ||
+          entry.ids.length === 0 ||
+          now - entry.ts > this.IDSET_TTL
+        ) {
           continue;
         }
         this.idSetCache.set(key, { ids: entry.ids, ts: entry.ts });
@@ -2231,7 +2354,7 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         );
       }
       console.error(`[Hitomi] Section "${section.id}" failed`, e);
-      return { items: [], metadata: undefined };
+      return { items: [], metadata };
     } finally {
       this.sectionRequestInFlight.delete(key);
     }
@@ -2951,6 +3074,32 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         this.randomSearchSessionQuery = "";
         this.randomSearchSessionIds = [];
         this.searchConsecutiveEmpty = 0;
+      }
+
+      // A bare numeric query is a gallery-ID lookup. Return the gallery even
+      // when Hide Read is on, matching NHentai's ID-search behavior.
+      const numericQuery = (query.title ?? "").trim();
+      if (/^\d+$/.test(numericQuery)) {
+        const galleryId = Number.parseInt(numericQuery, 10);
+        if (Number.isFinite(galleryId) && galleryId > 0) {
+          try {
+            const { items } = await this.getGalleryDetailsIncremental(
+              [galleryId],
+              0,
+              1,
+              undefined,
+              { skipHideRead: true, maxScanIds: 1 },
+            );
+            finishSearchWave("id", items.length);
+            return {
+              items: this.discoverItemsToSearchResults(items),
+              metadata: undefined,
+            };
+          } catch {
+            finishSearchWave("id", 0);
+            return { items: [], metadata: undefined };
+          }
+        }
       }
 
       if (sortBy === "related") {
@@ -4279,13 +4428,26 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         })
         : undefined;
 
-    const rawIds = await this.getGalleryIdsCached({
+    let rawIds = await this.getGalleryIdsCached({
       tags,
       range: idWindowRange,
       languages: languageTokens,
       isSearch: tags.length > 0,
       forceRefresh: offset === 0,
     });
+    const idWindowIncomplete =
+      !Array.isArray(rawIds) ||
+      rawIds.length === 0 ||
+      (offset > 0 && rawIds.length <= offset + limit);
+    if (idWindowIncomplete) {
+      rawIds = await this.getGalleryIdsCached({
+        tags,
+        range: idWindowRange,
+        languages: languageTokens,
+        isSearch: tags.length > 0,
+        forceRefresh: true,
+      });
+    }
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
       return { items: [], metadata: undefined };
     }
@@ -4361,13 +4523,26 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         })
         : undefined;
 
-    const rawIds = await this.getGalleryIdsCached({
+    let rawIds = await this.getGalleryIdsCached({
       tags,
       range: idWindowRange,
       languages: languageTokens,
       isSearch: tags.length > 0,
       forceRefresh: offset === 0,
     });
+    const idWindowIncomplete =
+      !Array.isArray(rawIds) ||
+      rawIds.length === 0 ||
+      (offset > 0 && rawIds.length <= offset + limit);
+    if (idWindowIncomplete) {
+      rawIds = await this.getGalleryIdsCached({
+        tags,
+        range: idWindowRange,
+        languages: languageTokens,
+        isSearch: tags.length > 0,
+        forceRefresh: true,
+      });
+    }
     if (!Array.isArray(rawIds) || rawIds.length === 0) {
       return { items: [], metadata: undefined };
     }
@@ -4475,15 +4650,30 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       filtered: pageFilter.min !== undefined || pageFilter.max !== undefined,
     });
 
-    const allIds = await this.getGalleryIdsCached({
+    let allIds = await this.getGalleryIdsCached({
       tags,
       range: idWindowRange,
       popularityOrderBy: period,
       languages: languageTokens,
       isSearch: tags.length > 0,
+      forceRefresh: offset === 0,
     });
+    const idWindowIncomplete =
+      !Array.isArray(allIds) ||
+      allIds.length === 0 ||
+      (offset > 0 && allIds.length <= offset + limit);
+    if (idWindowIncomplete) {
+      allIds = await this.getGalleryIdsCached({
+        tags,
+        range: idWindowRange,
+        popularityOrderBy: period,
+        languages: languageTokens,
+        isSearch: tags.length > 0,
+        forceRefresh: true,
+      });
+    }
 
-    if (allIds.length === 0) {
+    if (!Array.isArray(allIds) || allIds.length === 0) {
       return { items: [], metadata: undefined };
     }
 
@@ -4569,18 +4759,10 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         } finally {
           this.idSetPending.delete(key);
         }
-        // Only cache non-empty results to prevent poisoning from transient failures
+        // Only cache non-empty results. A transient empty response must not
+        // short-circuit the next section page with an instant zero-item result.
         if (fullIds.length > 0) {
           this.idSetCache.set(key, { ids: fullIds, ts: Date.now() });
-          this.saveIdSetCache();
-        } else {
-          // Cache empty results briefly (30s) to prevent redundant refetches
-          // when parallel sections request the same genuinely-empty tag.
-          // Uses a backdated ts so it expires sooner than the full IDSET_TTL.
-          this.idSetCache.set(key, {
-            ids: fullIds,
-            ts: Date.now() - this.IDSET_TTL + 30_000,
-          });
           this.saveIdSetCache();
         }
       }
@@ -4602,15 +4784,140 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     }
   }
 
+  // Base manga order for the current related feed. Cycle numbers (`r1`, `r2`,
+  // ...) are positions in this list, so a resumed feed starts at r1 instead of
+  // continuing the old absolute cycle numbering.
+  private relatedFeedHistory: string[] | undefined;
+  // Highest feed cycle displayed this session. A fresh load resumes after it
+  // instead of walking the feed from the start again.
+  private relatedFeedAnchorCycle = 0;
+  // Tiles displayed per cycle for the current feed; the 128-tile window is
+  // applied on launch using these counts.
+  private relatedCycleProgress: {
+    cycleIndex: number;
+    baseId: number;
+    shown: number;
+  }[] = [];
+  private relatedDisplayedThisSession = false;
+
+  /**
+   * Ordered base manga for the current related feed: manga read since the last
+   * visit, then everything after the cycle the user last scrolled to. Cycle
+   * numbers are positions in this list, so the first visible cycle is always
+   * r1 - even after restarting the app - instead of continuing at the old
+   * absolute history index (r55, r56, ...).
+   *
+   * On launch the feed keeps its previous start until a full 128 tiles were
+   * displayed; then only whole cycles inside that window are dropped and the
+   * counter restarts at 0. A new read during the session continues after the
+   * last displayed cycle instead of replaying the feed.
+   */
+  private getRelatedFeedHistory(): string[] {
+    // An empty feed is not cached: history may not be available yet on a cold
+    // start, and caching [] would keep the section empty for the session.
+    if (this.relatedFeedHistory && this.relatedFeedHistory.length > 0) {
+      return this.relatedFeedHistory;
+    }
+
+    const ordered = getReadCache().ordered;
+    const resume = getRelatedResumeState();
+    const topIndex = resume.top > 0 ? ordered.indexOf(String(resume.top)) : -1;
+    const newReads = topIndex > 0 ? ordered.slice(0, topIndex) : [];
+
+    let startIndex = 0;
+    // Until something is actually displayed this session, a rebuild must still
+    // honour the launch rule; otherwise a startup rebuild would resume after
+    // the last displayed cycle and wipe the counter.
+    const useLaunchRule = !this.relatedDisplayedThisSession;
+
+    if (useLaunchRule) {
+      // Launch: keep the same feed until a full 128-tile window was displayed.
+      // Then drop only whole cycles that fit inside the window, so the feed
+      // never resumes in the middle of a cycle and r1 is always complete.
+      const cycles = resume.cycles ?? [];
+      const totalShown = cycles.reduce((sum, cycle) => sum + cycle.shown, 0);
+      if (cycles.length > 0) {
+        let dropped = 0;
+        if (totalShown >= RELATED_AGE_WINDOW_TILES) {
+          let budget = RELATED_AGE_WINDOW_TILES;
+          for (let i = 0; i < cycles.length - 1; i++) {
+            if (cycles[i].shown > budget) break;
+            budget -= cycles[i].shown;
+            dropped = i + 1;
+          }
+        }
+        const keepBaseId = (dropped > 0 ? cycles[dropped] : cycles[0]).baseId;
+        const keepIndex = ordered.indexOf(String(keepBaseId));
+        if (keepIndex >= 0) startIndex = keepIndex;
+      }
+      // The 128-tile counter restarts at 0 on every launch.
+      resetRelatedShownWindow();
+    } else {
+      // A new read during the session continues after the last seen cycle.
+      const anchorIndex =
+        resume.anchor > 0 ? ordered.indexOf(String(resume.anchor)) : -1;
+      if (anchorIndex >= 0) startIndex = anchorIndex + 1;
+    }
+
+    const feed = Array.from(
+      new Set([...newReads, ...ordered.slice(startIndex)]),
+    );
+    this.relatedFeedHistory = feed;
+    this.relatedFeedAnchorCycle = 0;
+
+    // The counter only restarts on launch. When a new read rebuilds the feed,
+    // carry the counts over (re-keyed to the new feed) so a mid-session read
+    // does not reset it; prepended new reads start at 0 until displayed.
+    if (useLaunchRule) {
+      this.relatedCycleProgress = [];
+    } else {
+      const feedPosition = new Map<number, number>();
+      feed.forEach((id, index) => {
+        const base = parseInt(id, 10);
+        if (Number.isFinite(base)) feedPosition.set(base, index + 1);
+      });
+      this.relatedCycleProgress = this.relatedCycleProgress
+        .filter((entry) => feedPosition.has(entry.baseId))
+        .map((entry) => ({
+          ...entry,
+          cycleIndex: feedPosition.get(entry.baseId) ?? entry.cycleIndex,
+        }))
+        .sort((a, b) => a.cycleIndex - b.cycleIndex);
+    }
+
+    // Remember the newest read at feed creation so a later rebuild only treats
+    // manga read from now on as new. The previous ledger is kept until a page
+    // actually displays, so a build that shows nothing cannot wipe the counter.
+    const newest = parseInt(ordered[0] ?? "", 10);
+    saveRelatedResumeState({
+      top: Number.isFinite(newest) && newest > 0 ? newest : resume.top,
+      anchor: resume.anchor,
+      cycles: useLaunchRule
+        ? resume.cycles
+        : this.relatedCycleProgress.map(({ baseId, shown }) => ({
+          baseId,
+          shown,
+        })),
+    });
+
+    return feed;
+  }
+
   private async fetchRelatedPool(
     neededCount = 20,
-  ): Promise<{ id: number; tag: string; cycleIndex: number }[]> {
+  ): Promise<RelatedPoolEntry[]> {
+    const previous = this.relatedPoolLock;
+    let release!: () => void;
+    this.relatedPoolLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
     try {
-      // Get ordered read history (newest first)
-      const history = getReadCache().ordered;
+      // Base manga order for this feed (newest first). Cycle numbers are
+      // positions in this list, so a resumed feed starts at r1.
+      const history = this.getRelatedFeedHistory();
 
-      if (!Array.isArray(history) || history.length === 0) {
-        console.log("[Hitomi Related] No read history");
+      if (history.length === 0) {
         return [];
       }
 
@@ -4619,36 +4926,42 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         this.relatedPoolCache = [];
         this.relatedPoolLastHistoryIndex = 0;
         // Keep seenIds empty initially - we'll add base manga first, then mark as seen
-        // historyIdSet is used separately to prevent base manga from appearing via relatedIds
         this.relatedPoolSeenIds = new Set<number>();
-        this.relatedPoolHistoryIds = new Set<number>(
-          history
-            .map((hid) => parseInt(hid, 10))
-            .filter((id) => !Number.isNaN(id)),
-        );
       }
 
-      // Check if we need to load more
+      // Check if we need to load more. Invalidation can happen while an
+      // expansion is awaiting gallery data, so recreate the pool rather than
+      // dereferencing a null cache.
       while (
-        this.relatedPoolCache.length < neededCount &&
+        (this.relatedPoolCache?.length ?? 0) < neededCount &&
         this.relatedPoolLastHistoryIndex < history.length
       ) {
+        if (!this.relatedPoolCache) {
+          this.relatedPoolCache = [];
+          this.relatedPoolLastHistoryIndex = 0;
+          this.relatedPoolSeenIds = new Set<number>();
+        }
         await this.expandRelatedPool(history);
+        // One batch per call; the caller bounds how many batches a page spends.
+        break;
       }
 
-      return this.relatedPoolCache;
+      return this.relatedPoolCache ?? [];
     } catch (e) {
       console.error("[Hitomi] fetchRelatedPool failed", e);
       return this.relatedPoolCache ?? [];
+    } finally {
+      release();
     }
   }
 
   private sanitizeRelatedPool(
     value: unknown,
-  ): { id: number; tag: string; cycleIndex: number }[] {
+  ): RelatedPoolEntry[] {
     if (!Array.isArray(value)) return [];
 
-    const sanitized: { id: number; tag: string; cycleIndex: number }[] = [];
+    const sanitized: RelatedPoolEntry[] = [];
+    const seenIds = new Set<number>();
     for (const entry of value) {
       if (!entry || typeof entry !== "object") continue;
       const obj = entry as Record<string, unknown>;
@@ -4677,10 +4990,23 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
             ? ""
             : String(tagValue);
 
+      // A base header may share an id with an earlier related tile; keep it so
+      // its cycle still has a base (read manga are allowed as related tiles).
+      if (seenIds.has(idNum) && !tag.startsWith("[r")) continue;
+      seenIds.add(idNum);
+
+      const baseNum =
+        typeof obj.baseId === "number"
+          ? obj.baseId
+          : typeof obj.baseId === "string"
+            ? parseInt(obj.baseId, 10)
+            : NaN;
+
       sanitized.push({
         id: idNum,
         tag,
         cycleIndex: cycleNum,
+        baseId: Number.isFinite(baseNum) && baseNum > 0 ? baseNum : undefined,
       });
     }
 
@@ -4688,6 +5014,10 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
   }
 
   private async expandRelatedPool(history: string[]): Promise<void> {
+    const pool = this.relatedPoolCache;
+    if (!pool) return;
+    const seenIds = this.relatedPoolSeenIds;
+
     const startIndex = this.relatedPoolLastHistoryIndex;
     const endIndex = Math.min(
       startIndex + this.LAZY_BATCH_SIZE,
@@ -4695,7 +5025,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     );
 
     if (startIndex >= history.length) {
-      console.log("[Hitomi Related] All history processed");
       return;
     }
 
@@ -4733,75 +5062,57 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       } => g !== null,
     );
 
+    if (this.relatedPoolCache !== pool) return;
+
     // Process each gallery and add to pool
     // Use batchIndex to get correct cycle index (startIndex + batchIndex + 1)
     for (const g of validGalleries) {
       const cycleIndex = startIndex + g.batchIndex + 1;
 
-      // Add the read manga as [rN]
-      if (
-        Number.isFinite(g.id) &&
-        g.id > 0 &&
-        !this.relatedPoolSeenIds.has(g.id)
-      ) {
-        this.relatedPoolCache!.push({
-          id: g.id,
-          tag: `[r${cycleIndex}]`,
-          cycleIndex,
-        });
-        this.relatedPoolSeenIds.add(g.id);
-      }
-
-      // Add related items (allow duplicates across cycles, but avoid duplicates within the same base)
+      // Collect related items first: a cycle with no related entries would only
+      // show its own header, so it is skipped instead.
       let relatedCount = 0;
       const localSeen = new Set<number>();
+      const newEntries: RelatedPoolEntry[] = [];
       for (const rid of g.relatedIds) {
         if (relatedCount >= this.RELATED_PER_HISTORY) break;
         if (!Number.isFinite(rid) || rid <= 0) continue;
         if (rid === g.id) continue;
-        if (this.relatedPoolSeenIds.has(rid)) continue;
+        if (seenIds.has(rid)) continue;
         if (localSeen.has(rid)) continue;
-        if (this.relatedPoolHistoryIds.has(rid)) continue;
         localSeen.add(rid);
         relatedCount++;
-        this.relatedPoolCache!.push({
+        newEntries.push({
           id: rid,
           tag: `[${relatedCount}]`,
           cycleIndex,
+          baseId: g.id,
         });
-        this.relatedPoolSeenIds.add(rid);
+        seenIds.add(rid);
       }
+      if (newEntries.length === 0) continue;
+
+      // Add the read manga as [rN]. It may already be in the pool as a related
+      // tile of a newer cycle (read manga are not excluded from related
+      // entries); the header is still needed so its own cycle has a base.
+      if (Number.isFinite(g.id) && g.id > 0) {
+        pool.push({
+          id: g.id,
+          tag: `[r${cycleIndex}]`,
+          cycleIndex,
+          baseId: g.id,
+        });
+        seenIds.add(g.id);
+      }
+      pool.push(...newEntries);
     }
 
     // IMPORTANT: Always advance to endIndex, not startIndex + validGalleries.length
-    // This ensures we don't re-process failed items or get stuck in a loop
+    // This ensures we don't re-process failed items or get stuck in a loop.
+    // If the pool was invalidated while we were loading galleries, leave the
+    // cursor alone; the next fetch will rebuild from scratch.
+    if (this.relatedPoolCache !== pool) return;
     this.relatedPoolLastHistoryIndex = endIndex;
-  }
-
-  /** Persist related pool state once (called after the expansion while-loop). */
-  private persistRelatedPool(): void {
-    try {
-      const sanitizedPool = this.sanitizeRelatedPool(this.relatedPoolCache);
-      const persistedPool = takeEntriesWithinStateLimit(
-        sanitizedPool,
-        (candidate) => candidate,
-      );
-      this.relatedPoolCache = persistedPool;
-      Application.setState(persistedPool, this.RELATED_POOL_STATE_KEY);
-      Application.setState(
-        this.relatedPoolLastHistoryIndex,
-        this.RELATED_POOL_HISTORY_INDEX_KEY,
-      );
-      Application.setState(
-        takeEntriesWithinStateLimit(
-          Array.from(this.relatedPoolSeenIds),
-          (candidate) => candidate,
-        ),
-        this.RELATED_POOL_SEEN_IDS_KEY,
-      );
-    } catch {
-      // Ignore state errors
-    }
   }
 
   invalidateRelatedPool(): void {
@@ -4809,8 +5120,11 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
     this.relatedPoolCache = null;
     this.relatedPoolLastHistoryIndex = 0;
     this.relatedPoolSeenIds = new Set<number>();
-    this.relatedPoolHistoryIds = new Set<number>();
     this.relatedFirstSeenPage = new Map<number, number>();
+    this.relatedFeedHistory = undefined;
+    this.relatedFeedAnchorCycle = 0;
+    // Keep relatedCycleProgress: getRelatedFeedHistory() re-keys it to the
+    // rebuilt feed so a mid-session read does not wipe the launch ledger.
 
     // Clear persisted state
     try {
@@ -4821,7 +5135,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       // Ignore
     }
 
-    console.log("[Hitomi Related] Pool invalidated");
   }
 
   async getRelatedSection(
@@ -4845,9 +5158,9 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         : relatedCarouselTiles;
 
     try {
-      const history = getReadCache().ordered;
+      // Cycle numbers come from this feed, so a resumed section starts at r1.
+      const history = this.getRelatedFeedHistory();
       if (history.length === 0) {
-        console.log("[Hitomi Related] No history");
         return { items: [], metadata: undefined };
       }
 
@@ -4859,74 +5172,43 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       );
 
       if (pool.length === 0) {
-        console.log("[Hitomi Related] Empty pool");
         return { items: [], metadata: undefined };
       }
 
       // Apply hideReadInRelated filter while preserving [rN] cycle anchors.
+      // Only this dedicated toggle decides read filtering in Related; the
+      // general Hide Read Manga setting applies to Search and Discover only.
       const hideReadInRelated = getHideReadInRelatedSetting();
       const readCacheLocal = hideReadInRelated ? getReadCache() : null;
-      // When mark-read-on-desc is ON, exclude those manga from Related (they go to Last Read only)
-      const descMarkedIds =
-        getHideReadSetting() && getMarkReadOnViewSetting()
-          ? getDescMarkedReadIds()
-          : null;
 
-      // Filter pool: remove over-viewed items, session-aged items, AND optionally read items
-      const filterPool = (p: typeof pool) => {
-        const cycleLastIndex = new Map<number, number>();
-        for (let index = 0; index < p.length; index++) {
-          cycleLastIndex.set(p[index].cycleIndex, index);
-        }
-
-        return p.filter((item) => {
-          const tagValue = normalizeBridgeString(item.tag);
-          const isBaseCycle = tagValue.startsWith("[r");
-          if (
-            !isBaseCycle &&
-            hideReadInRelated &&
-            readCacheLocal &&
-            readCacheLocal.has(item.id.toString())
-          )
-            return false;
-          if (
-            !isBaseCycle &&
-            descMarkedIds &&
-            descMarkedIds.has(item.id.toString())
-          )
-            return false;
-          const cycleEndIndex = cycleLastIndex.get(item.cycleIndex);
-          if (
-            cycleEndIndex !== undefined &&
-            offset >= cycleEndIndex + RELATED_AGE_WINDOW_TILES
-          )
-            return false;
-          return true;
-        });
+      // Keep raw pool positions stable across pages: tiles are filtered in
+      // place instead of removed, so a large scan cursor can never point past
+      // the shrunken pool and end the related section early.
+      const shownWindow = new Set(getRelatedShownWindow());
+      const relatedItemKey = (item: RelatedPoolEntry): string => {
+        const fallbackBaseId = parseInt(history[item.cycleIndex - 1] ?? "", 10);
+        const baseId =
+          item.baseId ?? (Number.isFinite(fallbackBaseId) ? fallbackBaseId : 0);
+        return relatedShownKey(baseId, item.id);
       };
-      pool = filterPool(pool);
-
-      const reindexBaseTags = (
-        value: { id: number; tag: string; cycleIndex: number }[],
-      ) => {
-        let rCounter = 0;
-        for (const item of value) {
-          if (normalizeBridgeString(item.tag).startsWith("[r")) {
-            rCounter++;
-            item.tag = `[r${rCounter}]`;
-          }
-        }
+      const isPoolItemVisible = (item: RelatedPoolEntry): boolean => {
+        const tagValue = normalizeBridgeString(item.tag);
+        const isBaseCycle = tagValue.startsWith("[r");
+        if (
+          !isBaseCycle &&
+          hideReadInRelated &&
+          readCacheLocal &&
+          readCacheLocal.has(item.id.toString())
+        )
+          return false;
+        // A fresh load continues where the user stopped scrolling instead of
+        // repeating tiles that are still inside the age window.
+        if (shownWindow.has(relatedItemKey(item))) return false;
+        // Cycles already displayed this session stay hidden, so a fresh load
+        // picks up after them instead of walking the feed from r1 again.
+        if (item.cycleIndex <= this.relatedFeedAnchorCycle) return false;
+        return true;
       };
-      reindexBaseTags(pool);
-      const alignPoolStart = () => {
-        const firstCycleStart = pool.findIndex(
-          (item) => normalizeBridgeString(item.tag) === "[r1]",
-        );
-        if (firstCycleStart > 0) {
-          pool = pool.slice(firstCycleStart);
-        }
-      };
-      alignPoolStart();
 
       for (
         let tries = 0;
@@ -4936,26 +5218,20 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         tries++
       ) {
         neededItems += expandStep;
-        pool = filterPool(
-          this.sanitizeRelatedPool(await this.fetchRelatedPool(neededItems)),
+        pool = this.sanitizeRelatedPool(
+          await this.fetchRelatedPool(neededItems),
         );
-        reindexBaseTags(pool);
-        alignPoolStart();
       }
 
       if (
         pool.length < offset + minItems &&
         this.relatedPoolLastHistoryIndex < history.length
       ) {
-        pool = filterPool(
-          this.sanitizeRelatedPool(
-            await this.fetchRelatedPool(
-              offset + limit + prefetchBuffer + expandStep,
-            ),
+        pool = this.sanitizeRelatedPool(
+          await this.fetchRelatedPool(
+            offset + limit + prefetchBuffer + expandStep,
           ),
         );
-        reindexBaseTags(pool);
-        alignPoolStart();
 
         if (pool.length <= offset) {
           return { items: [], metadata: undefined };
@@ -4973,13 +5249,19 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       const displayOptions = getDisplayOptionsSetting();
       const showRelatedOrder = displayOptions.includes("show_related_order");
       const seenIds = new Set<number>();
+      const displayedKeys: string[] = [];
+      let displayedOldestCycle = 0;
 
       const loadBatchItems = async (
-        batchSlice: { id: number; tag: string; cycleIndex: number }[],
+        batchSlice: RelatedPoolEntry[],
       ): Promise<void> => {
         const galleryPromises = batchSlice
           .filter((item) => Number.isFinite(item.id) && item.id > 0)
-          .filter((item) => !seenIds.has(item.id))
+          .filter(
+            (item) =>
+              !seenIds.has(item.id) ||
+              normalizeBridgeString(item.tag).startsWith("[r"),
+          )
           .map(async (item) => {
             try {
               const gallery = await this.loadGallery(item.id.toString());
@@ -4994,7 +5276,8 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
           if (!result) continue;
           const { item, gallery } = result;
           if (!Number.isFinite(gallery.id) || gallery.id <= 0) continue;
-          if (seenIds.has(item.id)) continue;
+          const isBaseEntry = normalizeBridgeString(item.tag).startsWith("[r");
+          if (seenIds.has(item.id) && !isBaseEntry) continue;
           seenIds.add(item.id);
 
           const mangaId = normalizeBridgeString(gallery.id, item.id.toString());
@@ -5033,7 +5316,30 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
             ),
           });
 
+          // Count this tile toward its cycle for the 128-tile window.
+          const cycleBaseRaw =
+            item.baseId ?? parseInt(history[item.cycleIndex - 1] ?? "", 10);
+          const cycleBaseId =
+            Number.isFinite(cycleBaseRaw) && cycleBaseRaw > 0
+              ? cycleBaseRaw
+              : item.id;
+          const progress = this.relatedCycleProgress.find(
+            (entry) => entry.cycleIndex === item.cycleIndex,
+          );
+          if (progress) progress.shown++;
+          else
+            this.relatedCycleProgress.push({
+              cycleIndex: item.cycleIndex,
+              baseId: cycleBaseId,
+              shown: 1,
+            });
+
           incrementRelatedViewCount(item.id);
+          displayedKeys.push(relatedItemKey(item));
+          displayedOldestCycle = Math.max(
+            displayedOldestCycle,
+            item.cycleIndex,
+          );
           if (items.length >= limit) {
             break;
           }
@@ -5042,21 +5348,23 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
 
       let expansions = 0;
       const batchSize = Math.max(limit, relatedCarouselTiles);
+      // Each expansion spends one batch of gallery loads.
+      const expansionLimit = 3;
       while (items.length < limit) {
         if (cursor >= pool.length) {
           if (
             this.relatedPoolLastHistoryIndex >= history.length ||
-            expansions >= 3
+            expansions >= expansionLimit
           ) {
             break;
           }
 
+          // Hidden tiles still consume pool positions, so expand one batch at
+          // a time until the page fills.
           neededItems += expandStep;
-          pool = filterPool(
-            this.sanitizeRelatedPool(await this.fetchRelatedPool(neededItems)),
+          pool = this.sanitizeRelatedPool(
+            await this.fetchRelatedPool(neededItems),
           );
-          reindexBaseTags(pool);
-          alignPoolStart();
           expansions++;
 
           if (cursor >= pool.length) {
@@ -5064,10 +5372,24 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
           }
         }
 
+        const batchStart = cursor;
         const nextCursor = Math.min(cursor + batchSize, pool.length);
-        const batchSlice = pool.slice(cursor, nextCursor);
+        const batchSlice = pool
+          .slice(batchStart, nextCursor)
+          .filter((item) => isPoolItemVisible(item));
         cursor = nextCursor;
-        await loadBatchItems(batchSlice);
+        // Never show a cycle header without at least one related tile in the
+        // same batch, so headers cannot appear without tiles between them.
+        const visibleCycleIndexes = new Set(
+          batchSlice
+            .filter((item) => !normalizeBridgeString(item.tag).startsWith("[r"))
+            .map((item) => item.cycleIndex),
+        );
+        const guardedSlice = batchSlice.filter((item) => {
+          if (!normalizeBridgeString(item.tag).startsWith("[r")) return true;
+          return visibleCycleIndexes.has(item.cycleIndex);
+        });
+        await loadBatchItems(guardedSlice);
 
         if (items.length >= minItems && options?.carousel !== false) {
           break;
@@ -5077,12 +5399,41 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
       const hasMoreInPool = cursor < pool.length;
       const hasMoreHistory = this.relatedPoolLastHistoryIndex < history.length;
       const hasMore = hasMoreInPool || hasMoreHistory;
+      recordRelatedShownTiles(displayedKeys);
+      if (items.length > 0) {
+        this.relatedDisplayedThisSession = true;
+        // Advance only past cycles that finished displaying: when the page
+        // stopped inside a cycle, that cycle's remaining tiles must still be
+        // shown on the next page instead of being hidden by the anchor.
+        const partialCycleContinues =
+          cursor < pool.length &&
+          pool[cursor]?.cycleIndex === displayedOldestCycle;
+        const anchorCycle = partialCycleContinues
+          ? Math.max(0, displayedOldestCycle - 1)
+          : displayedOldestCycle;
+        this.relatedFeedAnchorCycle = Math.max(
+          this.relatedFeedAnchorCycle,
+          anchorCycle,
+        );
+        const resume = getRelatedResumeState();
+        const nextAnchor = parseInt(history[anchorCycle - 1] ?? "", 10);
+        saveRelatedResumeState({
+          top: resume.top,
+          anchor:
+            Number.isFinite(nextAnchor) && nextAnchor > 0
+              ? nextAnchor
+              : resume.anchor,
+          cycles: this.relatedCycleProgress
+            .slice(0, 80)
+            .map(({ baseId, shown }) => ({ baseId, shown })),
+        });
+      }
       recordDisplayedTiles(items);
 
       return {
         items,
         metadata: hasMore
-          ? buildOffsetMetadata(offset + items.length, limit, cursor)
+          ? buildOffsetMetadata(cursor, limit, cursor)
           : undefined,
       };
     } catch (e) {
@@ -5891,18 +6242,6 @@ export class HitomiExtension implements ExtensionImpl<typeof hitomiInfo> {
         title: "Characters",
         tags: gallery.characters.map((x) => ({
           id: buildId("character", x),
-          title: x,
-        })),
-      });
-    }
-
-    if (gallery.artists.length > 0) {
-      const uniqueArtists = [...new Set(gallery.artists)];
-      sections.push({
-        id: "artist",
-        title: "Artists",
-        tags: uniqueArtists.map((x) => ({
-          id: buildId("artist", x),
           title: x,
         })),
       });

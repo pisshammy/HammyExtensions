@@ -1228,14 +1228,14 @@ export function getDiscoverCarouselTilesSetting(): number {
   return clampStepperValue(
     Application.getState(DISCOVER_CAROUSEL_TILES_KEY),
     1,
-    6,
+    24,
     DEFAULT_DISCOVER_CAROUSEL_TILES,
   );
 }
 
 export function setDiscoverCarouselTilesSetting(value: number): void {
   Application.setState(
-    clampStepperValue(value, 1, 6, DEFAULT_DISCOVER_CAROUSEL_TILES),
+    clampStepperValue(value, 1, 24, DEFAULT_DISCOVER_CAROUSEL_TILES),
     DISCOVER_CAROUSEL_TILES_KEY,
   );
 }
@@ -1244,14 +1244,14 @@ export function getDiscoverPageTilesSetting(): number {
   return clampStepperValue(
     Application.getState(DISCOVER_PAGE_TILES_KEY),
     1,
-    12,
+    48,
     DEFAULT_DISCOVER_PAGE_TILES,
   );
 }
 
 export function setDiscoverPageTilesSetting(value: number): void {
   Application.setState(
-    clampStepperValue(value, 1, 12, DEFAULT_DISCOVER_PAGE_TILES),
+    clampStepperValue(value, 1, 48, DEFAULT_DISCOVER_PAGE_TILES),
     DISCOVER_PAGE_TILES_KEY,
   );
 }
@@ -1260,14 +1260,14 @@ export function getSearchPageTilesSetting(): number {
   return clampStepperValue(
     Application.getState(SEARCH_PAGE_TILES_KEY),
     1,
-    16,
+    48,
     DEFAULT_SEARCH_PAGE_TILES,
   );
 }
 
 export function setSearchPageTilesSetting(value: number): void {
   Application.setState(
-    clampStepperValue(value, 1, 16, DEFAULT_SEARCH_PAGE_TILES),
+    clampStepperValue(value, 1, 48, DEFAULT_SEARCH_PAGE_TILES),
     SEARCH_PAGE_TILES_KEY,
   );
 }

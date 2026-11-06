@@ -195,6 +195,8 @@ const EMPTY_QUERY = '""';
 const READ_STATE_KEY = "nhentai.readHistory";
 const COOKIE_JAR_STATE_KEY = "nhentai.cookieJar";
 const RELATED_VIEW_COUNTS_KEY = "nhentai.relatedViewCounts";
+const RELATED_SHOWN_WINDOW_KEY = "nhentai.relatedShownWindow";
+const RELATED_RESUME_STATE_KEY = "nhentai.relatedResume";
 const CDN_IMAGE_SERVERS_STATE_KEY = "nhentai.cdn.imageServers";
 const CDN_THUMB_SERVERS_STATE_KEY = "nhentai.cdn.thumbServers";
 const CDN_TS_STATE_KEY = "nhentai.cdn.ts";
@@ -214,9 +216,9 @@ const TILE_STORE_STATE_KEY = "nhentai.tileStore.v1";
 // JSC has no reliable setTimeout, so saves coalesce on change counts
 // instead of a time debounce.
 const GALLERY_CACHE_SAVE_BATCH = 8;
-// Above a search/discover page (25 items) so one page's tiles are written once
-// by the explicit flushTileStore() at the end of the request, not twice (batch
-// flush plus boundary flush).
+// Above the largest search/discover page (48 items) so one page's tiles are
+// written once by the explicit flushTileStore() at the end of the request, not
+// twice (batch flush plus boundary flush).
 const TILE_STORE_SAVE_BATCH = 64;
 // Keep initial discover burst to one request per section to manage rate limits.
 // With 6 discover sections (Popular, Recent, Random, etc.), this prevents burst 429s.
@@ -226,27 +228,29 @@ const DISCOVER_FETCH_BATCH_SIZE = 1;
 // Track how many times each related manga has been shown in the carousel
 let relatedViewCounts: Map<number, number> | undefined;
 /**
- * Related carousel cycles age out after user scrolls 72 tiles past the final item.
- * This allows cycles to gradually become stale while staying visible for initial discovery.
+ * A related tile may not be shown again until this many related tiles have
+ * been displayed since it last appeared. The window is persisted so a fresh
+ * load (new read, restart) resumes where the user stopped scrolling instead of
+ * repeating the tiles they already scrolled past.
  */
-const RELATED_AGE_WINDOW_TILES = 72;
+const RELATED_AGE_WINDOW_TILES = 128;
 
 function getCarouselTiles(): number {
   const value = getDiscoverCarouselTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_CAROUSEL_TILES;
-  return Math.max(1, Math.min(6, Math.floor(value)));
+  return Math.max(1, Math.min(24, Math.floor(value)));
 }
 
 function getDiscoverPageSize(): number {
   const value = getDiscoverPageTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_DISCOVER_PAGE_SIZE;
-  return Math.max(1, Math.min(12, Math.floor(value)));
+  return Math.max(1, Math.min(48, Math.floor(value)));
 }
 
 function getSearchPageSize(): number {
   const value = getSearchPageTilesSetting();
   if (!Number.isFinite(value)) return DEFAULT_SEARCH_PAGE_SIZE;
-  return Math.max(1, Math.min(16, Math.floor(value)));
+  return Math.max(1, Math.min(48, Math.floor(value)));
 }
 
 function getEffectiveOffset(metadata: PaginationMetadata | undefined): number {
@@ -292,6 +296,117 @@ function incrementRelatedViewCount(id: number): number {
   });
   Application.setState(obj, RELATED_VIEW_COUNTS_KEY);
   return newCount;
+}
+
+type RelatedPoolEntry = {
+  id: number;
+  tag: string;
+  cycleIndex: number;
+  baseId?: number;
+};
+
+// Persisted FIFO of related tiles that were already displayed. Entries are
+// keyed by base manga so a tile can still show up when it belongs to another
+// read manga's relations. Tiles fall out of the window once enough later tiles
+// have been displayed.
+let relatedShownWindow: string[] | undefined;
+
+function relatedShownKey(baseId: number, id: number): string {
+  return `${baseId}:${id}`;
+}
+
+function getRelatedShownWindow(): string[] {
+  if (!relatedShownWindow) {
+    const stored = Application.getState(RELATED_SHOWN_WINDOW_KEY) as unknown;
+    relatedShownWindow = Array.isArray(stored)
+      ? stored
+        .filter((value): value is string => typeof value === "string")
+        .slice(-RELATED_AGE_WINDOW_TILES)
+      : [];
+  }
+  return relatedShownWindow;
+}
+
+// One cycle in the related feed and how many of its tiles were displayed.
+// Cycles are kept in display order. On launch only whole cycles that fit
+// inside the 128-tile window are dropped, so a feed never resumes mid-cycle.
+type RelatedCycleProgress = {
+  baseId: number;
+  shown: number;
+};
+
+type RelatedResumeState = {
+  top: number;
+  anchor: number;
+  cycles?: RelatedCycleProgress[];
+};
+
+// Persisted resume point for the related feed. `anchor` is the base manga of
+// the last cycle the user scrolled to, `top` is the newest read manga at that
+// time. A fresh load keeps the cycles that were already scrolled past hidden
+// while still surfacing manga read after `top` first.
+let relatedResumeState: RelatedResumeState | undefined;
+
+function getRelatedResumeState(): RelatedResumeState {
+  if (!relatedResumeState) {
+    const stored = Application.getState(RELATED_RESUME_STATE_KEY) as
+      | { top?: unknown; anchor?: unknown; cycles?: unknown }
+      | undefined;
+    const cycles: RelatedCycleProgress[] = [];
+    if (Array.isArray(stored?.cycles)) {
+      for (const entry of stored.cycles) {
+        if (!entry || typeof entry !== "object") continue;
+        const value = entry as { baseId?: unknown; shown?: unknown };
+        if (typeof value.baseId !== "number" || value.baseId <= 0) continue;
+        if (typeof value.shown !== "number" || value.shown <= 0) continue;
+        cycles.push({ baseId: value.baseId, shown: Math.floor(value.shown) });
+      }
+    }
+    relatedResumeState = {
+      top: typeof stored?.top === "number" ? stored.top : 0,
+      anchor: typeof stored?.anchor === "number" ? stored.anchor : 0,
+      cycles,
+    };
+  }
+  return relatedResumeState;
+}
+
+function saveRelatedResumeState(next: RelatedResumeState): void {
+  relatedResumeState = next;
+  try {
+    Application.setState(next, RELATED_RESUME_STATE_KEY);
+  } catch {
+    // Keep the in-memory state even if persistence fails.
+  }
+}
+
+// The 128-tile counter restarts on every launch, so previously displayed
+// tiles are eligible again unless their whole cycle was dropped.
+function resetRelatedShownWindow(): void {
+  relatedShownWindow = [];
+  try {
+    Application.setState([], RELATED_SHOWN_WINDOW_KEY);
+  } catch {
+    // Keep the in-memory window even if persistence fails.
+  }
+}
+
+function recordRelatedShownTiles(keys: readonly string[]): void {
+  if (keys.length === 0) return;
+  const window = getRelatedShownWindow();
+  for (const key of keys) {
+    const existing = window.indexOf(key);
+    if (existing >= 0) window.splice(existing, 1);
+    window.push(key);
+  }
+  if (window.length > RELATED_AGE_WINDOW_TILES) {
+    window.splice(0, window.length - RELATED_AGE_WINDOW_TILES);
+  }
+  try {
+    Application.setState([...window], RELATED_SHOWN_WINDOW_KEY);
+  } catch {
+    // Keep the in-memory window even if persistence fails.
+  }
 }
 
 interface FilterOption {
@@ -790,12 +905,19 @@ async function withRateLimit<T>(
  * Non-blocking estimate of available slots in the current 60s window.
  * Used to short-circuit hydration before queuing requests that would stall.
  */
+/** True while a 429 cooldown makes every queued request block. */
+function isEndpointCoolingDown(endpointClass: EndpointClass): boolean {
+  return burstQueues[endpointClass].rateLimitedUntil > Date.now();
+}
+
 function availableSlotsNow(
   endpointClass: EndpointClass,
   authenticated: boolean,
   priority?: RequestPriority,
 ): number {
   const queue = burstQueues[endpointClass];
+  // An active 429 cooldown means every request would block inside the queue.
+  if (queue.rateLimitedUntil > Date.now()) return 0;
   const baseLimit = getEndpointRateLimit(endpointClass, authenticated);
   const reserve =
     priority === "background" ? getBackgroundReservedSlots(endpointClass) : 0;
@@ -1746,11 +1868,11 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           initialBufferTake,
           initialBufferTake.length,
         );
-        items.push(
-          ...hydratedFromBuffer.map((gallery) =>
-            this.mapGalleryToDiscoverItem(gallery),
-          ),
-        );
+        for (const gallery of hydratedFromBuffer) {
+          if (seenItemIds.has(gallery.id)) continue;
+          seenItemIds.add(gallery.id);
+          items.push(this.mapGalleryToDiscoverItem(gallery));
+        }
       }
 
       // Popular all-time and monthly need to scan deeper since heavy readers
@@ -2017,7 +2139,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       // Trigger prefetch for next page in discover when approaching pagination boundary
       // Only for page >1 (skip initial carousel load), when largest multiple of page size <= 25 is reached
       const discoverIsNotFirstPage = currentPage > 1;
-      const prefetchThreshold = 25 - (25 % sectionTileLimit);
+      // For page sizes above the 25-item API page, the old modulo formula
+      // yields 0 and prefetches on every page. Wait for a full page instead.
+      const prefetchThreshold =
+        sectionTileLimit > 25
+          ? sectionTileLimit
+          : 25 - (25 % sectionTileLimit);
       const discoverShouldPrefetch = discoverIsNotFirstPage && items.length >= prefetchThreshold && currentPage < (response?.num_pages ?? 999);
       if (discoverShouldPrefetch) {
         this.triggerDiscoverPrefetch(
@@ -2680,6 +2807,7 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       let pagesScannedThisCall = 0;
       let readSkippedTotal = 0;
       let filteredSkippedTotal = 0;
+      const seenSearchIds = new Set<string>();
       const appendSearchCandidates = async (
         pageCandidates: Gallery[],
         source: string,
@@ -2691,11 +2819,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           pageCandidates,
           pageCandidates.length,
         );
-        items.push(
-          ...hydratedCandidates.map((gallery) =>
-            this.mapGalleryToSearchResult(gallery),
-          ),
-        );
+        for (const gallery of hydratedCandidates) {
+          const galleryId = gallery.id.toString();
+          if (seenSearchIds.has(galleryId)) continue;
+          seenSearchIds.add(galleryId);
+          items.push(this.mapGalleryToSearchResult(gallery));
+        }
         logDebug(
           "search:hydrate",
           `page=${pageLabel}`,
@@ -2920,7 +3049,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       // Only for search/discover (not page 2 of new search), when largest multiple of page size <= 25 is reached
       const isPastFirstPage = currentPage > 1;
       const isNotSecondPageNewSearch = !(currentPage === 2 && pagination?.page === undefined);
-      const prefetchThreshold = 25 - (25 % searchPageSize);
+      // For page sizes above the 25-item API page, the old modulo formula
+      // yields 0 and prefetches on every page. Wait for a full page instead.
+      const prefetchThreshold =
+        searchPageSize > 25
+          ? searchPageSize
+          : 25 - (25 % searchPageSize);
       const shouldPrefetch = isPastFirstPage && isNotSecondPageNewSearch && items.length >= prefetchThreshold && nextPage <= (knownNumPages ?? 999);
       if (shouldPrefetch) {
         this.triggerSearchPrefetch(
@@ -3052,18 +3186,26 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   private galleryCache = new Map<string, GalleryCacheEntry>();
   private galleryCacheDirty = false;
   private galleryCachePendingChanges = 0;
-  private relatedPoolCache:
-    | { id: number; tag: string; cycleIndex: number }[]
-    | undefined;
+  private relatedPoolCache: RelatedPoolEntry[] | undefined;
+  private relatedPoolLock: Promise<void> = Promise.resolve();
   private relatedPoolLastHistoryIndex = 0;
   private relatedPoolSeenIds = new Set<number>();
-  private relatedPoolHistoryIds = new Set<number>(); // Track history IDs to exclude from relatedIds
   private relatedPoolMaxCursor = 0; // Max pool cursor seen across sessions for age-out
-  // True when the pool was restored from persisted state this session.
-  // When false, expandRelatedPool already populated the tile store in-session,
-  // so the rescrape block in getRelatedSection is redundant and would issue
-  // duplicate /api/v2/galleries/{id}/related requests.
-  private relatedPoolRestoredFromPersistence = false;
+  // Base manga order for the current related feed. Cycle numbers (`r1`, `r2`,
+  // ...) are positions in this list, so a resumed feed starts at r1 instead of
+  // continuing the old absolute cycle numbering.
+  private relatedFeedHistory: string[] | undefined;
+  // Highest feed cycle displayed this session. A fresh load resumes after it
+  // instead of walking the feed from the start again.
+  private relatedFeedAnchorCycle = 0;
+  // Tiles displayed per cycle for the current feed; the 128-tile window is
+  // applied on launch using these counts.
+  private relatedCycleProgress: {
+    cycleIndex: number;
+    baseId: number;
+    shown: number;
+  }[] = [];
+  private relatedDisplayedThisSession = false;
   // Session-based page tracking: maps item ID → page number when first displayed
   // Used to hide items after the configured related age window.
   private searchConsecutiveEmpty = 0; // Track consecutive empty pages to prevent infinite loops
@@ -3477,29 +3619,120 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
   }
 
 
+  /**
+   * Ordered base manga for the current related feed: manga read since the last
+   * visit, then everything after the cycle the user last scrolled to. Cycle
+   * numbers are positions in this list, so the first visible cycle is always
+   * r1 - even after restarting the app - instead of continuing at the old
+   * absolute history index (r55, r56, ...).
+   */
+  private getRelatedFeedHistory(): string[] {
+    // An empty feed is not cached: history may not be available yet on a cold
+    // start, and caching [] would keep the section empty for the session.
+    if (this.relatedFeedHistory && this.relatedFeedHistory.length > 0) {
+      return this.relatedFeedHistory;
+    }
+
+    const ordered = getReadCache().ordered;
+    const resume = getRelatedResumeState();
+    const topIndex = resume.top > 0 ? ordered.indexOf(String(resume.top)) : -1;
+    const newReads = topIndex > 0 ? ordered.slice(0, topIndex) : [];
+
+    let startIndex = 0;
+    // Until something is actually displayed this session, a rebuild must still
+    // honour the launch rule; otherwise a startup rebuild would resume after
+    // the last displayed cycle and wipe the counter.
+    const useLaunchRule = !this.relatedDisplayedThisSession;
+
+    if (useLaunchRule) {
+      // Launch: keep the same feed until a full 128-tile window was displayed.
+      // Then drop only whole cycles that fit inside the window, so the feed
+      // never resumes in the middle of a cycle and r1 is always complete.
+      const cycles = resume.cycles ?? [];
+      const totalShown = cycles.reduce((sum, cycle) => sum + cycle.shown, 0);
+      if (cycles.length > 0) {
+        let dropped = 0;
+        if (totalShown >= RELATED_AGE_WINDOW_TILES) {
+          let budget = RELATED_AGE_WINDOW_TILES;
+          for (let i = 0; i < cycles.length - 1; i++) {
+            if (cycles[i].shown > budget) break;
+            budget -= cycles[i].shown;
+            dropped = i + 1;
+          }
+        }
+        const keepBaseId = (dropped > 0 ? cycles[dropped] : cycles[0]).baseId;
+        const keepIndex = ordered.indexOf(String(keepBaseId));
+        if (keepIndex >= 0) startIndex = keepIndex;
+      }
+      // The 128-tile counter restarts at 0 on every launch.
+      resetRelatedShownWindow();
+    } else {
+      // A new read during the session continues after the last seen cycle.
+      const anchorIndex =
+        resume.anchor > 0 ? ordered.indexOf(String(resume.anchor)) : -1;
+      if (anchorIndex >= 0) startIndex = anchorIndex + 1;
+    }
+
+    const feed = Array.from(
+      new Set([...newReads, ...ordered.slice(startIndex)]),
+    );
+    this.relatedFeedHistory = feed;
+    this.relatedFeedAnchorCycle = 0;
+
+    // The counter only restarts on launch. When a new read rebuilds the feed,
+    // carry the counts over (re-keyed to the new feed) so a mid-session read
+    // does not reset it; prepended new reads start at 0 until displayed.
+    if (useLaunchRule) {
+      this.relatedCycleProgress = [];
+    } else {
+      const feedPosition = new Map<number, number>();
+      feed.forEach((id, index) => {
+        const base = parseInt(id, 10);
+        if (Number.isFinite(base)) feedPosition.set(base, index + 1);
+      });
+      this.relatedCycleProgress = this.relatedCycleProgress
+        .filter((entry) => feedPosition.has(entry.baseId))
+        .map((entry) => ({
+          ...entry,
+          cycleIndex: feedPosition.get(entry.baseId) ?? entry.cycleIndex,
+        }))
+        .sort((a, b) => a.cycleIndex - b.cycleIndex);
+    }
+
+    // Remember the newest read at feed creation so a later rebuild only treats
+    // manga read from now on as new. The previous ledger is kept until a page
+    // actually displays, so a build that shows nothing cannot wipe the counter.
+    const newest = parseInt(ordered[0] ?? "", 10);
+    saveRelatedResumeState({
+      top: Number.isFinite(newest) && newest > 0 ? newest : resume.top,
+      anchor: resume.anchor,
+      cycles: useLaunchRule
+        ? resume.cycles
+        : this.relatedCycleProgress.map(({ baseId, shown }) => ({
+          baseId,
+          shown,
+        })),
+    });
+
+    return feed;
+  }
+
   private async fetchRelatedPool(
     neededCount = 20,
-  ): Promise<{ id: number; tag: string; cycleIndex: number }[]> {
+  ): Promise<RelatedPoolEntry[]> {
+    const previous = this.relatedPoolLock;
+    let release!: () => void;
+    this.relatedPoolLock = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
     try {
-      // Get ordered read history (newest first)
-      const history = getReadCache().ordered;
+      // Base manga order for this feed (newest first). Cycle numbers are
+      // positions in this list, so a resumed feed starts at r1.
+      const history = this.getRelatedFeedHistory();
 
       if (history.length === 0) {
-        logDebug("fetchRelatedPool: No read history");
         return [];
-      }
-
-      // Check if in-session cached pool exists but read history changed at index 0 (new read item added)
-      if (
-        this.relatedPoolCache &&
-        this.relatedPoolCache.length > 0 &&
-        history.length > 0
-      ) {
-        const cycle1Item = this.relatedPoolCache.find((p) => p.cycleIndex === 1 && p.tag.startsWith("[r"));
-        if (cycle1Item && cycle1Item.id.toString() !== history[0]) {
-          logDebug("fetchRelatedPool: In-session history mismatch at cycle 1, invalidating pool cache");
-          this.invalidateRelatedPool();
-        }
       }
 
       // Initialize pool if needed
@@ -3507,91 +3740,50 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         this.relatedPoolCache = [];
         this.relatedPoolLastHistoryIndex = 0;
         // Keep seenIds empty initially - base manga are added first, then marked seen
-        // historyIds is used separately to prevent base manga from appearing via relatedIds
         this.relatedPoolSeenIds = new Set<number>();
-        this.relatedPoolHistoryIds = new Set<number>(
-          history
-            .map((hid) => parseInt(hid, 10))
-            .filter((id) => !Number.isNaN(id)),
-        );
-        this.relatedPoolRestoredFromPersistence = false;
 
-        // Try to restore from persisted state
-        try {
-          const persistedPool = Application.getState(
-            this.RELATED_POOL_STATE_KEY,
-          ) as { id: number; tag: string; cycleIndex: number }[] | undefined;
-          const persistedIndex = Application.getState(
-            this.RELATED_POOL_HISTORY_INDEX_KEY,
-          ) as number | undefined;
-          const persistedSeenIds = Application.getState(
-            this.RELATED_POOL_SEEN_IDS_KEY,
-          ) as number[] | undefined;
-          const persistedMaxCursor = Application.getState(
-            this.RELATED_POOL_MAX_CURSOR_KEY,
-          ) as number | undefined;
-
-          if (
-            persistedPool &&
-            persistedPool.length > 0 &&
-            typeof persistedIndex === "number"
-          ) {
-            // Validate that history hasn't changed at processed positions
-            let valid = true;
-            for (let i = 0; i < Math.min(persistedIndex, history.length); i++) {
-              // Check for base manga [rN] tag format
-              const poolItem = persistedPool.find(
-                (p) => p.cycleIndex === i + 1 && p.tag.startsWith("[r"),
-              );
-              if (poolItem && poolItem.id.toString() !== history[i]) {
-                valid = false;
-                break;
-              }
-            }
-
-            if (valid) {
-              this.relatedPoolCache = persistedPool;
-              this.relatedPoolLastHistoryIndex = persistedIndex;
-              // Always rebuild seenIds from the pool itself so that expandRelatedPool
-              // never re-adds items already in the pool (guards against stale/empty persisted seenIds).
-              this.relatedPoolSeenIds = new Set([
-                ...persistedPool.map((p) => p.id),
-                ...(persistedSeenIds ?? []),
-              ]);
-              this.relatedPoolMaxCursor = typeof persistedMaxCursor === "number" ? persistedMaxCursor : 0;
-              // Pool was restored from persistence — tile store may not have tiles
-              // for these IDs, so getRelatedSection's rescrape block is needed.
-              this.relatedPoolRestoredFromPersistence = true;
-              logDebug(
-                `fetchRelatedPool: Restored pool with ${persistedPool.length} items, index ${persistedIndex}, maxCursor ${this.relatedPoolMaxCursor}`,
-              );
-            }
-          }
-        } catch {
-          // Ignore state errors
-        }
+        // Pools are rebuilt from the feed every session. Restoring the
+        // persisted pool used to resurrect cycles without related entries and
+        // kept the old cycle numbering, so it is deliberately not restored.
       }
 
-      // Check if we need to load more
+      // Check if we need to load more. The pool can be invalidated while an
+      // expansion is in flight (for example when another manga is read), so
+      // recreate it instead of dereferencing an undefined cache.
       while (
-        this.relatedPoolCache.length < neededCount &&
+        (this.relatedPoolCache?.length ?? 0) < neededCount &&
         this.relatedPoolLastHistoryIndex < history.length
       ) {
+        if (!this.relatedPoolCache) {
+          this.relatedPoolCache = [];
+          this.relatedPoolLastHistoryIndex = 0;
+          this.relatedPoolSeenIds = new Set<number>();
+        }
+        // One batch per call: each batch issues LAZY_BATCH_SIZE /related
+        // requests, so the caller decides how much of the 30/min budget a page
+        // may spend. Stop instead of queueing when no slots are left.
+        if (isEndpointCoolingDown("related")) {
+          break;
+        }
         await this.expandRelatedPool(history);
+        break;
       }
 
-      // Persist once after all expansions (not per-batch)
-      this.persistRelatedPool();
-
-      return this.relatedPoolCache;
+      return this.relatedPoolCache ?? [];
     } catch (e) {
       if (e instanceof CloudflareError) throw e;
       console.error("[NHentai] fetchRelatedPool failed", e);
       return this.relatedPoolCache ?? [];
+    } finally {
+      release();
     }
   }
 
   private async expandRelatedPool(history: string[]): Promise<void> {
+    const pool = this.relatedPoolCache;
+    if (!pool) return;
+    const seenIds = this.relatedPoolSeenIds;
+
     const startIndex = this.relatedPoolLastHistoryIndex;
     const endIndex = Math.min(
       startIndex + this.LAZY_BATCH_SIZE,
@@ -3599,19 +3791,9 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     );
 
     if (startIndex >= history.length) {
-      logDebug("expandRelatedPool: All history processed");
       return;
     }
 
-    logDebug(
-      `expandRelatedPool: Processing history ${startIndex}-${endIndex} of ${history.length}`,
-    );
-    logDebug(
-      "expandRelatedPool: before",
-      `pool=${this.relatedPoolCache?.length ?? 0}`,
-      `seen=${this.relatedPoolSeenIds.size}`,
-      `historyIds=${this.relatedPoolHistoryIds.size}`,
-    );
 
     const batch = history.slice(startIndex, endIndex);
 
@@ -3628,13 +3810,14 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           g !== null,
       );
 
-    // Scrape related IDs with adaptive concurrency — start at 2 parallel
-    // requests, fall back to sequential on any 429/Cloudflare error.
+    // Scrape related IDs with 2 parallel requests. On any 429/503/Cloudflare
+    // error the batch stops and the failed base is retried on a later load.
     const relatedResults: {
       historyId: string;
       historyGalleryId: number;
       relatedIds: number[];
       batchIndex: number;
+      hitRateLimit: boolean;
     }[] = [];
     let concurrency = 2;
     let i = 0;
@@ -3656,11 +3839,9 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
             const msg = getErrorMessage(e);
             const isRateLimit =
               msg.includes("429") ||
+              msg.includes("503") ||
               msg.includes("Cloudflare") ||
               msg.includes("Non-JSON");
-            if (isRateLimit) {
-              logDebug("expandRelatedPool: 429 detected, reducing concurrency");
-            }
             return {
               historyId: hg.historyId,
               historyGalleryId: hg.id,
@@ -3672,118 +3853,86 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         }),
       );
       const hadRateLimit = chunkResults.some((r) => r.hitRateLimit);
-      if (hadRateLimit) {
-        concurrency = 1; // Fall back to sequential for remaining items
-        await this.pause(30);
-      }
       relatedResults.push(
         ...chunkResults.map((entry) => ({
           historyId: entry.historyId,
           historyGalleryId: entry.historyGalleryId,
           relatedIds: entry.relatedIds,
           batchIndex: entry.batchIndex,
+          hitRateLimit: entry.hitRateLimit,
         })),
       );
+      // The endpoint is cooling down: stop this batch instead of spending the
+      // rest of the page's request budget on calls that will fail and stall.
+      if (hadRateLimit) break;
       i += chunk.length;
     }
+
+    if (this.relatedPoolCache !== pool) return;
 
     // Process each history item and add to pool.
     // Language filtering is NOT done here — getRelatedSection() handles it
     // at display time. This avoids loading every related gallery just to
     // check its language, which caused 429 errors on NHentai.
     for (const r of relatedResults) {
+      // A rate-limited base has no related data. Leave it unprocessed so the
+      // next expansion retries it instead of emitting a header-only cycle.
+      if (r.hitRateLimit) break;
+
       const cycleIndex = startIndex + r.batchIndex + 1;
 
-      // Add the read manga as [rN] — always add base regardless of seenIds
-      // (a manga previously seen as a related item of another cycle may now be
-      // the history item for this cycle; relatedPoolHistoryIds guards against the
-      // reverse direction: a history item appearing as someone else's related).
-      const alreadyInPool = this.relatedPoolCache!.some(
-        (p) => p.id === r.historyGalleryId,
-      );
-      if (!alreadyInPool) {
-        this.relatedPoolCache!.push({
-          id: r.historyGalleryId,
-          tag: `[r${cycleIndex}]`,
-          cycleIndex,
-        });
-        this.relatedPoolSeenIds.add(r.historyGalleryId);
-      }
-
-      // Add related manga (unfiltered — language filtering is deferred)
+      // Collect related manga first (language filtering is deferred): a cycle
+      // with no related entries is not worth showing on its own.
       let relatedCount = 0;
+      const newEntries: RelatedPoolEntry[] = [];
       for (const rid of r.relatedIds) {
         if (relatedCount >= this.RELATED_PER_HISTORY) break;
-        if (this.relatedPoolSeenIds.has(rid)) continue;
-        if (this.relatedPoolHistoryIds.has(rid)) continue; // Skip other base manga
+        if (seenIds.has(rid)) continue;
+        if (rid === r.historyGalleryId) continue;
 
         relatedCount++;
-        this.relatedPoolCache!.push({
+        newEntries.push({
           id: rid,
           tag: `[${relatedCount}]`,
           cycleIndex,
+          baseId: r.historyGalleryId,
         });
-        this.relatedPoolSeenIds.add(rid);
+        seenIds.add(rid);
       }
-      logDebug(
-        "expandRelatedPool: cycle",
-        `cycle=${cycleIndex}`,
-        `base=${r.historyGalleryId}`,
-        `relatedFetched=${r.relatedIds.length}`,
-        `relatedAdded=${relatedCount}`,
-      );
+      if (newEntries.length === 0) continue;
+
+      // Add the read manga as [rN]. It may already be in the pool as a related
+      // tile of a newer cycle (read manga are not excluded from related
+      // entries); the header is still needed so its own cycle has a base.
+      pool.push({
+        id: r.historyGalleryId,
+        tag: `[r${cycleIndex}]`,
+        cycleIndex,
+        baseId: r.historyGalleryId,
+      });
+      seenIds.add(r.historyGalleryId);
+      pool.push(...newEntries);
     }
 
-    // IMPORTANT: Always advance to endIndex, not startIndex + validGalleries.length
-    // This ensures we don't re-process failed items or get stuck in a loop
-    this.relatedPoolLastHistoryIndex = endIndex;
-    logDebug(
-      `expandRelatedPool: Pool now has ${this.relatedPoolCache!.length} items`,
-    );
-    logDebug(
-      "expandRelatedPool: after",
-      `pool=${this.relatedPoolCache!.length}`,
-      `seen=${this.relatedPoolSeenIds.size}`,
-      `lastHistoryIndex=${this.relatedPoolLastHistoryIndex}`,
-    );
-  }
-
-  /** Persist related pool state once (called after the expansion while-loop). */
-  private persistRelatedPool(): void {
-    try {
-      const persistedPool = takeEntriesWithinStateLimit(
-        this.relatedPoolCache ?? [],
-        (candidate) => candidate,
-      );
-      this.relatedPoolCache = persistedPool;
-      Application.setState(persistedPool, this.RELATED_POOL_STATE_KEY);
-      Application.setState(
-        this.relatedPoolLastHistoryIndex,
-        this.RELATED_POOL_HISTORY_INDEX_KEY,
-      );
-      Application.setState(
-        takeEntriesWithinStateLimit(
-          Array.from(this.relatedPoolSeenIds),
-          (candidate) => candidate,
-        ),
-        this.RELATED_POOL_SEEN_IDS_KEY,
-      );
-      Application.setState(
-        this.relatedPoolMaxCursor,
-        this.RELATED_POOL_MAX_CURSOR_KEY,
-      );
-    } catch {
-      // Ignore state errors
-    }
+    // Stop at the first rate-limited base so the next expansion retries it.
+    // If the pool was invalidated while we were fetching, leave the cursor
+    // alone; the next fetch will rebuild from scratch.
+    if (this.relatedPoolCache !== pool) return;
+    const firstRateLimited = relatedResults.find((r) => r.hitRateLimit);
+    this.relatedPoolLastHistoryIndex = firstRateLimited
+      ? startIndex + firstRateLimited.batchIndex
+      : endIndex;
   }
 
   invalidateRelatedPool(): void {
     this.relatedPoolCache = undefined;
     this.relatedPoolLastHistoryIndex = 0;
     this.relatedPoolSeenIds = new Set<number>();
-    this.relatedPoolHistoryIds = new Set<number>();
     this.relatedPoolMaxCursor = 0;
-    this.relatedPoolRestoredFromPersistence = false;
+    this.relatedFeedHistory = undefined;
+    this.relatedFeedAnchorCycle = 0;
+    // Keep relatedCycleProgress: getRelatedFeedHistory() re-keys it to the
+    // rebuilt feed so a mid-session read does not wipe the launch ledger.
 
     try {
       Application.setState(undefined, this.RELATED_POOL_STATE_KEY);
@@ -3794,24 +3943,16 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       // Ignore
     }
 
-    logDebug("Related pool invalidated");
   }
 
   private async scrapeRelatedManga(mangaId: string): Promise<number[]> {
     try {
       // Always fetch fresh to populate tile store with tag_ids and metadata.
       // Tile store is used by getRelatedSection to avoid gallery detail requests.
-      logDebug("scrapeRelatedManga: fetching related for", mangaId);
       const response = await this.fetchJson<V2RelatedResponse>({
         url: `${API_V2_URL}/galleries/${encodeURIComponent(mangaId)}/related`,
         method: "GET",
       });
-      logDebug(
-        "scrapeRelatedManga: received",
-        response.result?.length ?? 0,
-        "items for",
-        mangaId,
-      );
       // Store tile info for each related item so related/history sections
       // can render without further gallery detail requests in lite mode.
       for (const item of response.result ?? []) {
@@ -3824,11 +3965,23 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
             Number.isFinite(id) && id.toString() !== mangaId,
         );
 
-      logDebug("Loaded", relatedIds.length, "related IDs for", mangaId);
       this.flushTileStore();
       return relatedIds;
     } catch (e) {
       if (e instanceof CloudflareError) throw e;
+      const message = getErrorMessage(e);
+      // Rate-limited responses must reach expandRelatedPool's hitRateLimit
+      // handling. Returning [] here would mark the base as having no related
+      // entries, skip it for the session, and let the next chunk block in the
+      // endpoint queue instead of stopping the batch cleanly.
+      if (
+        message.includes("429") ||
+        message.includes("503") ||
+        message.includes("Cloudflare") ||
+        message.includes("Non-JSON")
+      ) {
+        throw e;
+      }
       logDebug("Failed to load related manga for", mangaId, e);
       return [];
     }
@@ -3859,54 +4012,51 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
     }
 
     try {
-      const history = getReadCache().ordered;
+      // Cycle numbers come from this feed, so a resumed section starts at r1.
+      const history = this.getRelatedFeedHistory();
       if (history.length === 0) {
-        logDebug("getRelatedSection: No history");
         return { items: [], metadata: undefined };
       }
 
-      let neededItems = offset + limit + 40;
-      let pool = await this.fetchRelatedPool(neededItems);
+      let pool = await this.fetchRelatedPool(offset + limit + 20);
 
       if (pool.length === 0) {
-        logDebug("getRelatedSection: Empty pool");
         return { items: [], metadata: undefined };
       }
 
+      // Only the dedicated toggle decides read filtering in Related; the
+      // general Hide Read Manga setting applies to Search and Discover only.
       const hideReadInRelated = getHideReadInRelatedSetting();
       const readCache = hideReadInRelated ? getReadCache() : null;
-      const descMarkedIds =
-        getHideReadSetting() && getMarkReadOnViewSetting()
-          ? getDescMarkedReadIds()
-          : null;
 
-      const filterPool = (p: typeof pool) => {
-        return p.filter((item) => {
-          const isBaseCycle = item.tag.startsWith("[r");
-          if (
-            !isBaseCycle &&
-            hideReadInRelated &&
-            readCache &&
-            readCache.has(item.id.toString())
-          ) return false;
-          if (
-            !isBaseCycle &&
-            descMarkedIds &&
-            descMarkedIds.has(item.id.toString())
-          ) return false;
-          return true;
-        });
+      // Keep raw pool positions stable across pages. Filtering here shifted
+      // later indices, so a larger offset could point past the shrunken pool
+      // and end the related section early.
+      const shownWindow = new Set(getRelatedShownWindow());
+      const relatedItemKey = (item: RelatedPoolEntry): string => {
+        const fallbackBaseId = parseInt(history[item.cycleIndex - 1] ?? "", 10);
+        const baseId =
+          item.baseId ?? (Number.isFinite(fallbackBaseId) ? fallbackBaseId : 0);
+        return relatedShownKey(baseId, item.id);
       };
-
-      const alignPoolStart = () => {
-        const firstCycleStart = pool.findIndex((item) => item.tag === "[r1]");
-        if (firstCycleStart > 0) {
-          pool = pool.slice(firstCycleStart);
-        }
+      const isPoolItemVisible = (item: RelatedPoolEntry): boolean => {
+        const isBaseCycle = item.tag.startsWith("[r");
+        if (
+          !isBaseCycle &&
+          hideReadInRelated &&
+          readCache &&
+          readCache.has(item.id.toString())
+        ) return false;
+        // A fresh load continues where the user stopped scrolling instead of
+        // repeating tiles that are still inside the age window. The window is
+        // keyed per base manga, so entries related to another read manga can
+        // still show up again.
+        if (shownWindow.has(relatedItemKey(item))) return false;
+        // Cycles already displayed this session stay hidden, so a fresh load
+        // picks up after them instead of walking the feed from r1 again.
+        if (item.cycleIndex <= this.relatedFeedAnchorCycle) return false;
+        return true;
       };
-
-      pool = filterPool(pool);
-      alignPoolStart();
 
       for (
         let tries = 0;
@@ -3915,20 +4065,12 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
         this.relatedPoolLastHistoryIndex < history.length;
         tries++
       ) {
-        neededItems += 80;
-        pool = filterPool(await this.fetchRelatedPool(neededItems));
-        alignPoolStart();
+        // fetchRelatedPool spends at most one /related batch (rate-limit gate).
+        pool = await this.fetchRelatedPool(pool.length + 20);
       }
 
-      if (
-        pool.length < offset + minItems &&
-        this.relatedPoolLastHistoryIndex < history.length
-      ) {
-        pool = filterPool(await this.fetchRelatedPool(offset + limit + 120));
-        alignPoolStart();
-        if (pool.length <= offset) {
-          return { items: [], metadata: undefined };
-        }
+      if (pool.length <= offset) {
+        return { items: [], metadata: undefined };
       }
 
       let cursor = Math.min(offset, pool.length);
@@ -3941,64 +4083,38 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
       const displayOptions = getDisplayOptionsSetting();
       const showRelatedOrder = displayOptions.includes("show_related_order");
       const seenIds = new Set<number>();
+      const displayedKeys: string[] = [];
+      let displayedOldestCycle = 0;
       let expansions = 0;
       const batchSize = Math.max(limit, relatedCarouselTiles);
+      // Each expansion spends one /related batch. The queue paces requests
+      // inside the 30/min window (and stops only during a real 429 cooldown),
+      // so a page may spend a few batches to find tiles instead of ending at 0.
+      const expansionLimit = 8;
       let languageSkipped = 0;
 
-      // For pool items in the upcoming display window: if any tiles are missing,
-      // re-scrape that cycle's base (fetches related tiles).
-      // Lookahead is capped to the current page (limit items) to avoid bursting
-      // related requests for cycles far ahead on each scroll.
-      //
-      // Only run when the pool was restored from persistence this session.
-      // When expandRelatedPool built the pool in-session, scrapeRelatedManga
-      // already populated the tile store — re-running it here would issue
-      // duplicate /api/v2/galleries/{id}/related requests.
-      const windowEnd = Math.min(cursor + limit, pool.length);
-      const windowSlice = pool.slice(cursor, windowEnd);
-
-      // Find cycles that have any missing tiles (cap at 4 to avoid 429s)
-      const cyclesNeedingRescrape = new Set<number>();
-      if (this.relatedPoolRestoredFromPersistence) {
-        for (const item of windowSlice) {
-          if (cyclesNeedingRescrape.size >= 4) break;
-          if (!this.tileStore.has(item.id.toString())) {
-            cyclesNeedingRescrape.add(item.cycleIndex);
-          }
-        }
-      }
-
-      if (cyclesNeedingRescrape.size > 0) {
-        const rescrapePromises: Promise<void>[] = [];
-        for (const cycleIndex of cyclesNeedingRescrape) {
-          const historyId = history[cycleIndex - 1];
-          if (!historyId) continue;
-          rescrapePromises.push(
-            (async () => {
-              try {
-                // Re-scrape related tiles for this cycle to populate tile store
-                await this.scrapeRelatedManga(historyId);
-              } catch {
-                /* non-critical */
-              }
-            })(),
-          );
-        }
-        if (rescrapePromises.length > 0) {
-          await Promise.all(rescrapePromises);
-        }
-      }
+      const matchesRelatedLanguage = (id: number): boolean => {
+        if (relatedLang === "all") return true;
+        const tagIds = this.tileStore.get(id.toString())?.tag_ids ?? [];
+        return relatedLang === "english"
+          ? tagIds.includes(LANGUAGE_TAG_IDS.english)
+          : relatedLang === "chinese"
+            ? tagIds.includes(LANGUAGE_TAG_IDS.chinese)
+            : relatedLang === "japanese"
+              ? tagIds.includes(LANGUAGE_TAG_IDS.japanese)
+              : false;
+      };
 
       while (items.length < limit) {
         if (cursor >= pool.length) {
           if (
             this.relatedPoolLastHistoryIndex >= history.length ||
-            expansions >= 3
+            expansions >= expansionLimit
           ) break;
 
-          neededItems += 80;
-          pool = filterPool(await this.fetchRelatedPool(neededItems));
-          alignPoolStart();
+          // Hidden tiles still consume pool positions, so expand one batch at
+          // a time until the page fills or the batch budget runs out.
+          pool = await this.fetchRelatedPool(pool.length + 20);
           expansions++;
 
           if (cursor >= pool.length) continue;
@@ -4006,30 +4122,37 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
 
         const item = pool[cursor++];
 
-        if (seenIds.has(item.id)) continue;
+        const isBaseCycle = item.tag.startsWith("[r");
+        // A base header may share an id with an earlier related tile; keep it
+        // so the cycle is not rendered base-less.
+        if (seenIds.has(item.id) && !isBaseCycle) continue;
         seenIds.add(item.id);
 
-        const isBaseCycle = item.tag.startsWith("[r");
+        if (!isPoolItemVisible(item)) continue;
 
-        if (!isBaseCycle && hideReadInRelated && readCache && readCache.has(item.id.toString())) {
-          continue;
+        // Never show a cycle header without at least one related tile that
+        // will actually render (visible, not language-filtered).
+        if (isBaseCycle) {
+          let hasVisibleRelated = false;
+          for (let scan = cursor; scan < pool.length; scan++) {
+            const candidate = pool[scan];
+            if (candidate.cycleIndex !== item.cycleIndex) break;
+            if (candidate.tag.startsWith("[r")) continue;
+            if (
+              isPoolItemVisible(candidate) &&
+              matchesRelatedLanguage(candidate.id)
+            ) {
+              hasVisibleRelated = true;
+              break;
+            }
+          }
+          if (!hasVisibleRelated) continue;
         }
 
         // Language filter — tile always has tag_ids from /related response
-        if (!isBaseCycle && relatedLang !== "all") {
-          const tile = this.tileStore.get(item.id.toString());
-          const tagIds = tile?.tag_ids ?? [];
-          const hasPreferredLanguage = relatedLang === "english"
-            ? tagIds.includes(LANGUAGE_TAG_IDS.english)
-            : relatedLang === "chinese"
-              ? tagIds.includes(LANGUAGE_TAG_IDS.chinese)
-              : relatedLang === "japanese"
-                ? tagIds.includes(LANGUAGE_TAG_IDS.japanese)
-                : false;
-          if (!hasPreferredLanguage) {
-            languageSkipped++;
-            continue;
-          }
+        if (!isBaseCycle && !matchesRelatedLanguage(item.id)) {
+          languageSkipped++;
+          continue;
         }
 
         // Build display data from tile store.
@@ -4079,19 +4202,68 @@ export class NHentaiExtension implements ExtensionImpl<typeof NHentaiConfig> {
           metadata: undefined,
         });
 
+        // Count this tile toward its cycle for the 128-tile window.
+        const cycleBaseRaw =
+          item.baseId ?? parseInt(history[item.cycleIndex - 1] ?? "", 10);
+        const cycleBaseId =
+          Number.isFinite(cycleBaseRaw) && cycleBaseRaw > 0
+            ? cycleBaseRaw
+            : item.id;
+        const progress = this.relatedCycleProgress.find(
+          (entry) => entry.cycleIndex === item.cycleIndex,
+        );
+        if (progress) progress.shown++;
+        else
+          this.relatedCycleProgress.push({
+            cycleIndex: item.cycleIndex,
+            baseId: cycleBaseId,
+            shown: 1,
+          });
+
         incrementRelatedViewCount(item.id);
+        displayedKeys.push(relatedItemKey(item));
+        displayedOldestCycle = Math.max(displayedOldestCycle, item.cycleIndex);
       }
 
       const hasMoreInPool = cursor < pool.length;
       const hasMoreHistory = this.relatedPoolLastHistoryIndex < history.length;
       const hasMore = hasMoreInPool || hasMoreHistory;
+      recordRelatedShownTiles(displayedKeys);
+      if (items.length > 0) {
+        this.relatedDisplayedThisSession = true;
+        // Advance only past cycles that finished displaying: when the page
+        // stopped inside a cycle, that cycle's remaining tiles must still be
+        // shown on the next page instead of being hidden by the anchor.
+        const partialCycleContinues =
+          cursor < pool.length &&
+          pool[cursor]?.cycleIndex === displayedOldestCycle;
+        const anchorCycle = partialCycleContinues
+          ? Math.max(0, displayedOldestCycle - 1)
+          : displayedOldestCycle;
+        this.relatedFeedAnchorCycle = Math.max(
+          this.relatedFeedAnchorCycle,
+          anchorCycle,
+        );
+        const resume = getRelatedResumeState();
+        const nextAnchor = parseInt(history[anchorCycle - 1] ?? "", 10);
+        saveRelatedResumeState({
+          top: resume.top,
+          anchor:
+            Number.isFinite(nextAnchor) && nextAnchor > 0
+              ? nextAnchor
+              : resume.anchor,
+          cycles: this.relatedCycleProgress
+            .slice(0, 80)
+            .map(({ baseId, shown }) => ({ baseId, shown })),
+        });
+      }
       recordDisplayedTiles(items);
 
       const description = languageSkipped > 0 ? `${languageSkipped} language filtered` : undefined;
       return {
         items,
         metadata: hasMore
-          ? buildOffsetMetadata(offset + items.length, cursor)
+          ? buildOffsetMetadata(cursor, cursor)
           : undefined,
         description,
       } as PagedResults<DiscoverSectionItem> & { description?: string };

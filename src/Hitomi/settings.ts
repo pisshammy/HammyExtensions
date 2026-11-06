@@ -482,14 +482,14 @@ export function getDiscoverCarouselTilesSetting(): number {
   return clampStepperValue(
     Application.getState(DISCOVER_CAROUSEL_TILES_KEY),
     1,
-    16,
+    24,
     DEFAULT_DISCOVER_CAROUSEL_TILES,
   );
 }
 
 export function setDiscoverCarouselTilesSetting(value: number): void {
   Application.setState(
-    clampStepperValue(value, 1, 16, DEFAULT_DISCOVER_CAROUSEL_TILES),
+    clampStepperValue(value, 1, 24, DEFAULT_DISCOVER_CAROUSEL_TILES),
     DISCOVER_CAROUSEL_TILES_KEY,
   );
 }

@@ -734,7 +734,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Carousel",
           value: this.discoverCarouselTiles,
           minValue: 1,
-          maxValue: 12,
+          maxValue: 24,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
@@ -746,7 +746,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Discover",
           value: this.discoverPageTiles,
           minValue: 1,
-          maxValue: 16,
+          maxValue: 48,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
@@ -758,7 +758,7 @@ class MangaFiltersForm extends Form {
           title: "Tiles on Search",
           value: this.searchPageTiles,
           minValue: 1,
-          maxValue: 16,
+          maxValue: 48,
           stepValue: 1,
           loopOver: false,
           onValueChange: Application.Selector(
@@ -1022,7 +1022,7 @@ class MangaFiltersForm extends Form {
     this.discoverCarouselTiles = this.normalizeStepperValue(
       value,
       1,
-      6,
+      24,
       this.discoverCarouselTiles,
     );
     setDiscoverCarouselTilesSetting(this.discoverCarouselTiles);
@@ -1033,7 +1033,7 @@ class MangaFiltersForm extends Form {
     this.discoverPageTiles = this.normalizeStepperValue(
       value,
       1,
-      12,
+      48,
       this.discoverPageTiles,
     );
     setDiscoverPageTilesSetting(this.discoverPageTiles);
@@ -1044,7 +1044,7 @@ class MangaFiltersForm extends Form {
     this.searchPageTiles = this.normalizeStepperValue(
       value,
       1,
-      16,
+      48,
       this.searchPageTiles,
     );
     setSearchPageTilesSetting(this.searchPageTiles);
