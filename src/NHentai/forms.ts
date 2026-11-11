@@ -312,11 +312,26 @@ export class SettingsForm extends Form {
   private removeSpaces = getRemoveSeparatorSpacesSetting();
 
   /**
-   * Re-read API key auth status / rate-limit footer when returning from nested forms.
-   * Nested forms also call reloadForm on this parent as soon as auth completes.
+   * Re-read persisted settings before building sections.
+   *
+   * The form must not refresh itself from a lifecycle hook: the app's form
+   * bridge invokes `formWillAppear` as a value-returning call and logs
+   * "returned a value of type `undefined`, but expected type `any`" for the
+   * void return every time the form appears. Nested forms already call
+   * `reloadForm()` on this parent once they change something, which re-runs
+   * `getSections()`; syncing here keeps every render current instead.
    */
-  override formWillAppear(): void {
-    this.reloadForm();
+  private syncFromSettings(): void {
+    this.languageSetting = getLanguageSetting();
+    this.dateFormat = NHentaiSettings.getDateFormatSetting();
+    this.dateSeparator = NHentaiSettings.getDateSeparatorSetting();
+    this.useMilitaryTime = NHentaiSettings.getMilitaryTimeSetting();
+    this.displayOptions = getDisplayOptionsSetting();
+    this.enableRelated = getEnableRelatedSetting();
+    this.relatedLanguage = getRelatedLanguageSetting();
+    this.thumbnailQuality = getThumbnailQualitySetting();
+    this.hideRead = getHideReadSetting();
+    this.removeSpaces = getRemoveSeparatorSpacesSetting();
   }
 
   async updateLanguage(value: string[]): Promise<void> {
@@ -454,6 +469,9 @@ export class SettingsForm extends Form {
   }
 
   override getSections(): FormSectionElement<unknown>[] {
+    // Refresh values in case a nested form (e.g. API key) changed them.
+    this.syncFromSettings();
+
     // Build subtitle example based on current display options
     const sep = this.removeSpaces ? "|" : " | ";
     const parts: string[] = [];
