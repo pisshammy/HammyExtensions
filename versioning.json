@@ -1,5 +1,5 @@
 {
-  "buildTime": "2026-11-06T08:12:00.580Z",
+  "buildTime": "2026-11-11T15:29:03.281Z",
   "builtWith": {
     "toolchain": "1.0.0-alpha.91",
     "types": "1.0.0-alpha.91"
@@ -35,7 +35,7 @@
     {
       "name": "NHentai",
       "description": "Extension that pulls content from nhentai.net",
-      "version": "3.1.1",
+      "version": "3.1.2",
       "icon": "icon.png",
       "language": "multi",
       "contentRating": "ADULT",
@@ -50,7 +50,7 @@
       "developers": [
         {
           "name": "pisshammy",
-          "website": "cashapp: $0hammy0"
+          "website": "if you want to show love from cashapp: $0hammy0"
         }
       ],
       "id": "NHentai"
